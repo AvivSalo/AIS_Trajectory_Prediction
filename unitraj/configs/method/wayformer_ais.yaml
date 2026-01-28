@@ -1,0 +1,55 @@
+# AIS Marine Traffic Wayformer Configuration
+# Optimized for vessel trajectory prediction
+
+# common
+model_name: wayformer_ais
+
+# model - Marine-specific settings
+use_map_image: False  # No road images in marine environment
+use_map_lanes: False  # No lane information for vessels
+num_modes: 6          # Trajectory prediction modes
+num_agent_feature: 39 # Agent feature dimensions (keep same for compatibility)
+num_map_feature: 1    # Minimal dummy map features
+hidden_size: 256
+num_encoder_layers: 2
+num_decoder_layers: 8
+tx_hidden_size: 1024
+tx_num_heads: 4
+dropout: 0.1
+entropy_weight: 40.0
+kl_weight: 20.0
+use_FDEADE_aux_loss: True
+num_queries_dec: 64
+num_queries_enc: 192
+
+# train - Optimized for single-scene overfitting with interpolated data
+max_epochs: 30  # Quick overfitting test on 707 samples
+learning_rate: 0.0005  # Moderate LR for faster convergence on clean data
+learning_rate_sched: [ 25, 28 ]  # Decay schedule adjusted for 30 epochs
+optimizer: AdamW
+scheduler: multistep
+ewc_lambda: 2000
+grad_clip_norm: 10  # Higher clip for stability
+train_batch_size: 8   # Larger batch size (2459 samples / 8 = ~307 batches per epoch)
+eval_batch_size: 8    # Match train batch size
+
+# data related - Marine environment settings
+max_num_agents: 10        # Match dataloader config (reduced from 16)
+map_range: 22000          # 22km = 12NM nautical mile range (scenario extent, not used for normalization)
+position_scale: 100.0     # Normalization scale for ego-relative coordinates (meters)
+                          # Default: 100m (typical vessel movement range for ego-relative coords)
+                          # NOTE: NOT map_range/2 - that's for scenario-relative coordinates
+velocity_scale: 20.0      # Max typical vessel velocity for normalization (m/s)
+max_num_roads: 1         # Minimal dummy roads
+max_points_per_lane: 1   # Not used for marine
+manually_split_lane: False
+point_sampled_interval: 1
+num_points_each_polyline: 1
+vector_break_dist_thresh: 1.0
+
+# AIS-specific parameters
+coordinate_system: "relative"  # Use relative coordinates from ego vessel
+interpolation_method: "linear" # Linear interpolation for missing data
+max_interpolation_gap: 2.0     # Max 2 seconds gap for interpolation
+vessel_types: ["cargo", "tanker", "container", "bulk", "other"] 
+

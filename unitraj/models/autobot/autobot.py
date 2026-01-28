@@ -385,8 +385,8 @@ class AutoBotEgo(BaseModel):
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.config['learning_rate'], eps=0.0001)
-        scheduler = MultiStepLR(optimizer, milestones=self.config['learning_rate_sched'], gamma=0.5,
-                                verbose=True)
+        scheduler = MultiStepLR(optimizer, milestones=self.config['learning_rate_sched'], gamma=0.5)
+                                # verbose=True)
         return [optimizer], [scheduler]
 
 

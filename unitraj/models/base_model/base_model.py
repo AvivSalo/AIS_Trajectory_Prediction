@@ -235,8 +235,19 @@ class BaseModel(pl.LightningModule):
         predicted_traj = prediction['predicted_trajectory']
         predicted_prob = prediction['predicted_probability'].detach().cpu().numpy()
 
-        # Calculate ADE losses
-        ade_diff = torch.norm(predicted_traj[:, :, :, :2] - gt_traj[:, :, :, :2], 2, dim=-1)
+        # De-normalize coordinates if normalization is enabled
+        # This ensures metrics are computed in real-world units (meters)
+        if self.config.get('normalize_data', False):
+            # Use explicit position_scale if provided, otherwise fall back to map_range/2
+            position_scale = self.config.get('position_scale', self.config.get('map_range', 22000.0) / 2.0)
+            predicted_traj_denorm = predicted_traj * position_scale
+            gt_traj_denorm = gt_traj * position_scale
+        else:
+            predicted_traj_denorm = predicted_traj
+            gt_traj_denorm = gt_traj
+
+        # Calculate ADE losses (now in meters if data was normalized)
+        ade_diff = torch.norm(predicted_traj_denorm[:, :, :, :2] - gt_traj_denorm[:, :, :, :2], 2, dim=-1)
         ade_losses = torch.sum(ade_diff * gt_traj_mask, dim=-1) / torch.sum(gt_traj_mask, dim=-1)
         ade_losses = ade_losses.cpu().detach().numpy()
         minade = np.min(ade_losses, axis=1)

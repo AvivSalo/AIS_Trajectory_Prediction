@@ -5,6 +5,7 @@ from unitraj.models.wayformer.wayformer import Wayformer
 __all__ = {
     'autobot': AutoBotEgo,
     'wayformer': Wayformer,
+    'wayformer_ais': Wayformer,  # Use same Wayformer model for AIS data
     'MTR': MotionTransformer,
 }
 

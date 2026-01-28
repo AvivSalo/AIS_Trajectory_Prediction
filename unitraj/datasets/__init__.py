@@ -1,10 +1,12 @@
 from .MTR_dataset import MTRDataset
 from .autobot_dataset import AutoBotDataset
 from .wayformer_dataset import WayformerDataset
+from .ais_dataset import AISDataset
 
 __all__ = {
     'autobot': AutoBotDataset,
     'wayformer': WayformerDataset,
+    'wayformer_ais': AISDataset,  # AIS-specific wayformer dataset
     'MTR': MTRDataset,
 }
 

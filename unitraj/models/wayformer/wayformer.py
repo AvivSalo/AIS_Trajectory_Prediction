@@ -3,9 +3,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import optim
+import logging
 
 from unitraj.models.base_model.base_model import BaseModel
 from .wayformer_utils import PerceiverEncoder, PerceiverDecoder, TrainableQueryProvider
+
+logger = logging.getLogger(__name__)
 
 
 def init(module, weight_init, bias_init, gain=1):
@@ -123,6 +126,7 @@ class Wayformer(BaseModel):
 
         B = ego_in.size(0)
         num_agents = agents_in.shape[2] + 1
+
         # Encode all input observations (k_attr --> d_k)
         ego_tensor, _agents_tensor, opps_masks_agents, env_masks = self.process_observations(ego_in, agents_in)
         agents_tensor = torch.cat((ego_tensor.unsqueeze(2), _agents_tensor), dim=2)
@@ -134,18 +138,16 @@ class Wayformer(BaseModel):
         mixed_input_features = torch.concat([agents_emb, road_pts_feats], dim=1)
         opps_masks_roads = (1.0 - roads[:, :self.max_num_roads, :, -1]).to(torch.bool)
         mixed_input_masks = torch.concat([opps_masks_agents.view(B, -1), opps_masks_roads.view(B, -1)], dim=1)
-        # Process through Wayformer's encoder
 
+        # Process through Wayformer's encoder
         context = self.perceiver_encoder(mixed_input_features, mixed_input_masks)
 
-        # Wazformer-Ego Decoding
-
+        # Wayformer-Ego Decoding
         out_seq = self.perceiver_decoder(context)
 
         out_dists = self.output_model(out_seq[:, :self.c]).reshape(B, self.c, self.T, -1)
 
         # Mode prediction
-
         mode_probs = self.prob_predictor(out_seq[:, :self.c]).reshape(B, self.c)
 
         # return  [c, T, B, 5], [B, c]
@@ -154,12 +156,33 @@ class Wayformer(BaseModel):
         output['predicted_trajectory'] = out_dists  # [B, c, T, 5] to be able to parallelize code
         output['scene_emb'] = out_seq[:, :self.num_queries_dec].reshape(B, -1)
         if len(np.argwhere(np.isnan(out_dists.detach().cpu().numpy()))) > 1:
-            breakpoint()
+            logger.warning("Found NaN values in output distances")
         return output
 
     def forward(self, batch):
         model_input = {}
         inputs = batch['input_dict']
+
+        # DEBUG: Check multi-agent prediction capability
+        if hasattr(self, '_debug_logged') is False:
+            self._debug_logged = True
+            logger.info("="*80)
+            logger.info("WAYFORMER FORWARD - DEBUG INFO")
+            logger.info("="*80)
+            logger.info(f"Batch size: {inputs['obj_trajs'].shape[0]}")
+            logger.info(f"Input agents shape: {inputs['obj_trajs'].shape}")  # [B, num_agents, timesteps, features]
+            logger.info(f"track_index_to_predict: {inputs['track_index_to_predict']}")
+
+            # Check if multi-agent fields exist
+            if 'all_agents_gt_trajs' in inputs:
+                logger.info(f"✅ Multi-agent GT available: {inputs['all_agents_gt_trajs'].shape}")
+                logger.info(f"   agents_to_predict: {inputs.get('agents_to_predict', 'N/A')}")
+            else:
+                logger.info("❌ No multi-agent GT found - predicting single agent only")
+
+            logger.info(f"center_gt_trajs shape: {inputs['center_gt_trajs'].shape}")  # Single agent GT
+            logger.info("="*80)
+
         agents_in, agents_mask, roads = inputs['obj_trajs'], inputs['obj_trajs_mask'], inputs['map_polylines']
         ego_in = torch.gather(agents_in, 1, inputs['track_index_to_predict'].view(-1, 1, 1, 1).repeat(1, 1,
                                                                                                       *agents_in.shape[

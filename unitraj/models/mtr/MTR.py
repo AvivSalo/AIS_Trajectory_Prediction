@@ -76,7 +76,7 @@ class MotionTransformer(BaseModel):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.config['learning_rate'],
                                       weight_decay=self.config['weight_decay'])
 
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lbmd, last_epoch=-1, verbose=True)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lbmd, last_epoch=-1)#, verbose=True)
         return [optimizer], [scheduler]
 
 
