@@ -78,16 +78,9 @@ class AISDataset(Dataset):
 
             print(f"Found {len(pickle_files)} pickle files and {len(csv_files)} CSV files in {data_path}")
 
-            # Apply max_data_num limit if specified
-            max_data_num = self.config.get('max_data_num', [None])
-            if isinstance(max_data_num, list):
-                max_limit = max_data_num[idx] if idx < len(max_data_num) else None
-            else:
-                max_limit = max_data_num
-
-            # Convert to int if needed (handles Hydra ListConfig)
-            if max_limit is not None:
-                max_limit = int(max_limit)
+            # Apply max_data_num limit if specified (matches base_dataset.py pattern)
+            max_data_num_list = self.config.get('max_data_num', [None])
+            max_limit = max_data_num_list[idx] if idx < len(max_data_num_list) else None
 
             if max_limit is not None and max_limit > 0:
                 pickle_files = pickle_files[:max_limit]
