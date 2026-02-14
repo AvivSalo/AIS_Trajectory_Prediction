@@ -291,6 +291,52 @@ class EvaluationCallback(pl.Callback):
             logger.error(f"Failed to extract reference coordinates from CSV for {scenario_id}: {str(e)}")
             return None
 
+    def _get_reference_coordinates_from_pickle(self, scenario_id):
+        """
+        Extract reference coordinates directly from pickle file.
+
+        Args:
+            scenario_id: Scenario ID like "ais_arc-integrity_20250315_060000"
+
+        Returns:
+            Tuple of (reference_lat, reference_lon) or None if not found
+        """
+        try:
+            import pickle
+            from pathlib import Path
+
+            # Try to find the pickle file in data paths
+            if self.config is not None and 'val_data_path' in self.config:
+                val_paths = self.config['val_data_path']
+                if not isinstance(val_paths, list):
+                    val_paths = [val_paths]
+
+                for val_path in val_paths:
+                    # Look for scenario directory and pickle file
+                    scenario_dir = Path(val_path) / scenario_id
+                    pkl_path = scenario_dir / f"{scenario_id}.pkl"
+
+                    if pkl_path.exists():
+                        with open(pkl_path, 'rb') as f:
+                            data = pickle.load(f)
+
+                        # Check if reference coordinates are in the pickle
+                        if 'reference_lat' in data and 'reference_lon' in data:
+                            ref_lat = float(data['reference_lat'])
+                            ref_lon = float(data['reference_lon'])
+                            logger.info(f"Found reference coordinates from pickle: lat={ref_lat:.6f}, lon={ref_lon:.6f}")
+                            return ref_lat, ref_lon
+                        else:
+                            logger.warning(f"Pickle file found but no reference coordinates: {pkl_path}")
+                            return None
+
+            logger.warning(f"Could not find pickle file for scenario: {scenario_id}")
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to extract reference coordinates from pickle for {scenario_id}: {str(e)}")
+            return None
+
     def _create_maritime_scene_visualization(self, scenario_id, scene_obj_trajs, scene_obj_mask,
                                            pred_trajs_latlon, gt_trajs_latlon, pl_module):
         """
@@ -320,13 +366,16 @@ class EvaluationCallback(pl.Callback):
                 logger.warning(f"No valid agents found in scenario {scenario_id}")
                 return
 
-            # Get correct reference coordinates from original CSV file
-            ref_coords = self._get_reference_coordinates_from_csv(scenario_id)
+            # Get correct reference coordinates - try pickle first, then CSV, then fallback
+            ref_coords = self._get_reference_coordinates_from_pickle(scenario_id)
+            if ref_coords is None:
+                ref_coords = self._get_reference_coordinates_from_csv(scenario_id)
+
             if ref_coords is not None:
                 reference_lat, reference_lon = ref_coords
                 logger.info(f"Using reference coordinates for {scenario_id}: lat={reference_lat:.6f}, lon={reference_lon:.6f}")
             else:
-                # Fallback to default (Mediterranean center) if CSV not found
+                # Fallback to default (Mediterranean center) if neither pickle nor CSV available
                 reference_lat, reference_lon = 31.833351, 34.618101
                 logger.warning(f"Using fallback reference coordinates for {scenario_id}")
 

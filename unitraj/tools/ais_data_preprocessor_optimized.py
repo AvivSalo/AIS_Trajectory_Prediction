@@ -250,7 +250,9 @@ def process_ais_file(file_path, output_dir):
         'scenario_id': scene_id,
         'tracks': {},
         'timestamps': df['timestamp'].values,
-        'scenario_features': np.array([])
+        'scenario_features': np.array([]),
+        'reference_lat': float(reference_lat),
+        'reference_lon': float(reference_lon)
     }
 
     for idx, trajectory in enumerate(trajectories):
