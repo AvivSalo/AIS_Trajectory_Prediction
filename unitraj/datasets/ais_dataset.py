@@ -85,6 +85,10 @@ class AISDataset(Dataset):
             else:
                 max_limit = max_data_num
 
+            # Convert to int if needed (handles Hydra ListConfig)
+            if max_limit is not None:
+                max_limit = int(max_limit)
+
             if max_limit is not None and max_limit > 0:
                 pickle_files = pickle_files[:max_limit]
                 csv_files = csv_files[:max_limit]
