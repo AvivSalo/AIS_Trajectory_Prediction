@@ -67,7 +67,7 @@ class AISDataset(Dataset):
         """Load and preprocess AIS data files (CSV or pickle)"""
         print(f"Loading {'validation' if self.is_validation else 'training'} AIS data...")
 
-        for data_path in self.data_paths:
+        for idx, data_path in enumerate(self.data_paths):
             # Check for pickle files in subdirectories (scenario directories)
             pickle_files = list(Path(data_path).glob("ais_*/*.pkl"))
             # Also check root level for backward compatibility
@@ -77,6 +77,18 @@ class AISDataset(Dataset):
             csv_files = list(Path(data_path).glob("*.csv"))
 
             print(f"Found {len(pickle_files)} pickle files and {len(csv_files)} CSV files in {data_path}")
+
+            # Apply max_data_num limit if specified
+            max_data_num = self.config.get('max_data_num', [None])
+            if isinstance(max_data_num, list):
+                max_limit = max_data_num[idx] if idx < len(max_data_num) else None
+            else:
+                max_limit = max_data_num
+
+            if max_limit is not None and max_limit > 0:
+                pickle_files = pickle_files[:max_limit]
+                csv_files = csv_files[:max_limit]
+                print(f"Limited to {len(pickle_files)} pickle files and {len(csv_files)} CSV files (max_data_num={max_limit})")
 
             # Process pickle files if available
             if pickle_files:
