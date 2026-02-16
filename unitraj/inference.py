@@ -24,10 +24,10 @@ from typing import Dict, List, Optional, Tuple, Union
 from omegaconf import DictConfig
 import pytorch_lightning as pl
 
-from models import build_model
-from datasets import build_dataset
-from evaluation_utils import CoordinateConverter, MetricsCalculator
-from visualizations import VisualizationFactory
+from .models import build_model
+from .datasets import build_dataset
+from .evaluation_utils import CoordinateConverter, MetricsCalculator
+from .visualizations import VisualizationFactory
 
 logger = logging.getLogger(__name__)
 
