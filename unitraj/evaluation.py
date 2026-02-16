@@ -1706,8 +1706,8 @@ class EvaluationCallback(pl.Callback):
                     }});
                 }}
 
-                // 3. PREDICTION TRAJECTORY (dotted line - only for predicted vessel at initial window)
-                if (isPredicted && currentTime === initialWindowStart && predictionCoords.length > 0) {{
+                // 3. PREDICTION TRAJECTORY (dotted line - only for predicted vessel)
+                if (isPredicted && predictionCoords.length > 0) {{
                     const predLine = L.polyline(predictionCoords, {{
                         color: vesselColor,
                         weight: 8,
