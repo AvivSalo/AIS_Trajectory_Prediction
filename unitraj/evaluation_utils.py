@@ -35,15 +35,19 @@ class CoordinateConverter:
         """
         Convert relative meters to lat/lon using reference point.
 
-        ⚠️  WARNING: This function expects ABSOLUTE coordinates in METERS!
+        ⚠️  WARNING: This function expects ABSOLUTE coordinates in METERS, not normalized values!
+        Maritime trajectories typically span 10-1000+ meters.
+
         If you're passing model outputs, make sure to:
         1. Denormalize: multiply by position_scale (e.g., 100.0)
         2. Add absolute offset: add ego_last_abs_x/y from pickle data
         3. Then pass to this function
 
+        Passing normalized values (< 1.0) will trigger a warning and cause spatial offset errors!
+
         Args:
-            x_meters: X coordinate in meters
-            y_meters: Y coordinate in meters
+            x_meters: X coordinate in meters (absolute, not normalized)
+            y_meters: Y coordinate in meters (absolute, not normalized)
             ref_lat: Reference latitude
             ref_lon: Reference longitude
 
@@ -51,11 +55,18 @@ class CoordinateConverter:
             Tuple of (latitude, longitude)
         """
         # Validation: detect if normalized values are accidentally passed
+        # Maritime trajectories typically span 10-1000+ meters
+        # If values are < 1.0, they're likely normalized values that need transformation
         if abs(x_meters) < 1.0 and abs(y_meters) < 1.0:
             logger.warning(
-                f"⚠️  COORDINATE WARNING: Values look like NORMALIZED coordinates!\n"
+                f"⚠️  COORDINATE WARNING: Values look like NORMALIZED coordinates, not meters!\n"
                 f"   Received: x={x_meters:.6f}, y={y_meters:.6f}\n"
-                f"   Expected: absolute coordinates in meters (typically 10-1000+ meters)"
+                f"   Expected: absolute coordinates in meters (typically 10-1000+ meters)\n"
+                f"   If these are model outputs, you must:\n"
+                f"     1. Denormalize: multiply by position_scale (e.g., 100.0)\n"
+                f"     2. Add offset: add ego_last_abs_x/y from pickle data\n"
+                f"     3. Then convert to lat/lon\n"
+                f"   This will cause spatial offset in visualization!"
             )
 
         # Conversion factors
