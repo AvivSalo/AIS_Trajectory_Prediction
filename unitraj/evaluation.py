@@ -837,11 +837,13 @@ class EvaluationCallback(pl.Callback):
         Returns:
             Path to generated HTML file
         """
-        # Get reference coordinates for this scenario
-        ref_coords = self._get_reference_coordinates_from_csv(scenario_id)
+        # Get reference coordinates for this scenario - try pickle first, then CSV, then fallback
+        ref_coords = self._get_reference_coordinates_from_pickle(scenario_id)
+        if ref_coords is None:
+            ref_coords = self._get_reference_coordinates_from_csv(scenario_id)
 
         if ref_coords is None:
-            # Fallback to default location if CSV lookup fails
+            # Fallback to default location if neither pickle nor CSV lookup succeeds
             ref_lat, ref_lon = -34.755450, 22.990367
             print(f"Warning: Could not find reference coordinates for {scenario_id}, using fallback")
         else:
@@ -899,10 +901,20 @@ class EvaluationCallback(pl.Callback):
                 if match:
                     window_start_idx = int(match.group(1))
 
+            # Prepare ALL vessel timeline data for interactive navigation
+            all_vessel_timeline_data = []  # Full timeline data for JavaScript
+            total_timesteps = 0
+
             if pickle_data is not None:
                 logger.info(f"✅ Using original pickle data for absolute positions (window start: t={window_start_idx})")
                 tracks = pickle_data['tracks']
                 track_ids = list(tracks.keys())
+
+                # Get total timeline length from first vessel
+                if len(track_ids) > 0:
+                    first_track = tracks[track_ids[0]]
+                    total_timesteps = len(first_track['state']['position'])
+                    logger.info(f"📊 Total timeline: {total_timesteps} timesteps (~{total_timesteps/3600:.1f} hours)")
 
                 for agent_idx in range(min(num_agents, len(track_ids))):
                     track_id = track_ids[agent_idx]
@@ -910,7 +922,25 @@ class EvaluationCallback(pl.Callback):
                     positions = track_data['state']['position']  # Absolute scenario-relative positions
                     velocities = track_data['state']['velocity']  # [vx, vy] in m/s
 
-                    # Extract positions for this window
+                    # Convert ALL positions to lat/lon for interactive timeline
+                    all_positions_latlon = []
+                    all_speeds_knots = []
+                    for t in range(len(positions)):
+                        x, y = positions[t]
+                        lat, lon = self._meters_to_latlon(float(x), float(y), ref_lat, ref_lon)
+                        all_positions_latlon.append([float(lat), float(lon)])
+
+                        vx, vy = velocities[t]
+                        speed_ms = np.sqrt(vx**2 + vy**2)
+                        speed_knots = speed_ms * 1.94384
+                        all_speeds_knots.append(float(speed_knots))
+
+                    all_vessel_timeline_data.append({
+                        'positions': all_positions_latlon,
+                        'speeds': all_speeds_knots
+                    })
+
+                    # Extract positions for this window (for initial static view)
                     past_start = window_start_idx
                     past_end = window_start_idx + past_len
                     future_end = past_end + (future_gt.shape[1] if future_gt is not None else 5)
@@ -1179,7 +1209,19 @@ class EvaluationCallback(pl.Callback):
                 else:
                     metrics_html += f"<p><strong>{key}:</strong> {value}</p>"
             metrics_html += "</div>"
-        
+
+        # Define variables for HTML template (ensure they're available in both single/multi-agent modes)
+        if scene_context is not None:
+            # past_len already defined in multi-agent block
+            future_len = future_gt.shape[1] if future_gt is not None else 60
+        else:
+            # Single-agent mode: infer from ground truth shape
+            past_len = 21  # Default
+            future_len = ground_truth.shape[1] if len(ground_truth.shape) > 1 else 60
+            total_timesteps = 0
+            all_vessel_timeline_data = []
+            window_start_idx = 0
+
         html_template = f'''<!DOCTYPE html>
 <html>
 <head>
@@ -1195,7 +1237,7 @@ class EvaluationCallback(pl.Callback):
     
     <style>
         body {{ margin: 0; padding: 0; font-family: Arial, sans-serif; }}
-        #map {{ height: 100vh; width: 100%; }}
+        #map {{ height: {'calc(100vh - 140px)' if total_timesteps > 0 else '100vh'}; width: 100%; }}
         .info-panel {{
             position: absolute;
             top: 10px;
@@ -1283,6 +1325,94 @@ class EvaluationCallback(pl.Callback):
         .toggle-btn.active:hover {{
             background: #45a049;
         }}
+        .timeline-controls .toggle-btn {{
+            padding: 8px 16px;
+            font-size: 13px;
+            font-weight: bold;
+        }}
+        .timeline-controls {{
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: rgba(255, 255, 255, 0.98);
+            padding: 15px 20px;
+            box-shadow: 0 -2px 10px rgba(0,0,0,0.2);
+            z-index: 1001;
+        }}
+        .control-row {{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            margin-bottom: 8px;
+        }}
+        .nav-btn {{
+            padding: 8px 16px;
+            background: #2c5aa0;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: bold;
+            transition: background 0.3s;
+        }}
+        .nav-btn:hover {{
+            background: #1e4070;
+        }}
+        .nav-btn:disabled {{
+            background: #ccc;
+            cursor: not-allowed;
+        }}
+        .time-display {{
+            font-size: 16px;
+            font-weight: bold;
+            color: #2c5aa0;
+            min-width: 220px;
+            text-align: center;
+            background: #f0f0f0;
+            padding: 8px 12px;
+            border-radius: 5px;
+        }}
+        .time-slider {{
+            flex: 1;
+            max-width: 600px;
+            height: 6px;
+            border-radius: 3px;
+            background: #ddd;
+            outline: none;
+            cursor: pointer;
+        }}
+        .time-slider::-webkit-slider-thumb {{
+            appearance: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #2c5aa0;
+            cursor: pointer;
+        }}
+        .time-slider::-moz-range-thumb {{
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #2c5aa0;
+            cursor: pointer;
+            border: none;
+        }}
+        .step-selector {{
+            padding: 6px 10px;
+            border-radius: 5px;
+            border: 2px solid #2c5aa0;
+            font-size: 13px;
+            cursor: pointer;
+            background: white;
+        }}
+        .step-label {{
+            font-size: 13px;
+            font-weight: bold;
+            color: #555;
+        }}
     </style>
 </head>
 <body>
@@ -1307,23 +1437,87 @@ class EvaluationCallback(pl.Callback):
         📡 Loading scenario map...
     </div>
 
+    <div class="timeline-controls" id="timeline-controls" style="display: {'block' if total_timesteps > 0 else 'none'};">
+        <div class="control-row">
+            <button class="nav-btn" id="btn-first" onclick="goToFirst()">⏮️ First</button>
+            <button class="nav-btn" id="btn-prev" onclick="previousFrame()">⬅️ Prev</button>
+            <div class="time-display" id="time-display">T = {window_start_idx}s</div>
+            <button class="nav-btn" id="btn-next" onclick="nextFrame()">Next ➡️</button>
+            <button class="nav-btn" id="btn-last" onclick="goToLast()">⏭️ Last</button>
+            <button class="nav-btn" id="btn-play" onclick="togglePlay()">▶️ Play</button>
+        </div>
+        <div class="control-row">
+            <span class="step-label">Step:</span>
+            <select class="step-selector" id="step-selector" onchange="updateStepSize()">
+                <option value="1">1s</option>
+                <option value="5">5s</option>
+                <option value="10" selected>10s</option>
+                <option value="30">30s</option>
+                <option value="60">1min</option>
+                <option value="300">5min</option>
+                <option value="600">10min</option>
+            </select>
+            <input type="range" class="time-slider" id="time-slider"
+                   min="0" max="{max(0, total_timesteps - past_len - future_len) if total_timesteps > 0 else 100}"
+                   value="{window_start_idx}" oninput="onSliderChange(this.value)">
+            <span class="step-label" id="time-range-label">0 - {total_timesteps if total_timesteps > 0 else 0}s</span>
+        </div>
+        <div class="control-row">
+            <span class="step-label">Show/Hide:</span>
+            <button class="toggle-btn active" id="btn-toggle-history" onclick="toggleAllHistory()">📍 History</button>
+            <button class="toggle-btn active" id="btn-toggle-gt" onclick="toggleAllGT()">🎯 Future GT</button>
+            <button class="toggle-btn active" id="btn-toggle-pred" onclick="toggleAllPredictions()">🤖 Predictions</button>
+        </div>
+    </div>
+
     <script>
         console.log('🚢 Loading AIS Scenario: {scenario_id}');
 
-        // Trajectory data - multi-agent with PAST, FUTURE GT, and PREDICTIONS separated
+        // STATIC DATA (for single window visualization - backward compatibility)
         const predictionCoords = {json.dumps(pred_coords)};
-        const allVesselsPast = {json.dumps(all_vessel_past_coords if scene_context else [])};  // Past (observed) trajectories
-        const allVesselsFutureGT = {json.dumps(all_vessel_future_coords if scene_context else [])};  // Future GT trajectories
-        const vesselIds = {json.dumps(all_vessel_ids)};  // Array of vessel indices
+        const allVesselsPast = {json.dumps(all_vessel_past_coords if scene_context else [])};
+        const allVesselsFutureGT = {json.dumps(all_vessel_future_coords if scene_context else [])};
+        const allVesselSpeeds = {json.dumps(all_vessel_speeds if scene_context else [])};
+
+        // TIMELINE DATA (full 4-hour scene for interactive navigation)
+        const timelineData = {json.dumps(all_vessel_timeline_data) if scene_context and total_timesteps > 0 else '[]'};
+        const totalTimesteps = {total_timesteps if total_timesteps > 0 else 0};
+        const pastLen = {past_len};
+        const futureLen = {future_len};
+        const initialWindowStart = {window_start_idx};
+
+        // Vessel metadata
+        const vesselIds = {json.dumps(all_vessel_ids)};
         const vesselColors = {json.dumps(vessel_colors[:len(all_vessel_ids)])};
         const predictedVesselColor = '{predicted_vessel_color}';
         const predictedVesselIdx = {predicted_idx if scene_context else 0};
-        const allVesselSpeeds = {json.dumps(all_vessel_speeds if scene_context else [])};  // Speed data for each vessel
 
-        console.log('📊 Prediction points:', predictionCoords.length);
-        console.log('📊 Past trajectories:', allVesselsPast.length);
-        console.log('📊 Future GT trajectories:', allVesselsFutureGT.length);
-        console.log('📊 Vessel speeds:', allVesselSpeeds.length);
+        // Timeline state
+        let currentTime = initialWindowStart;
+        let stepSize = 10;
+        let isPlaying = false;
+        let playInterval = null;
+        const maxCurrentTime = Math.max(0, totalTimesteps - pastLen - futureLen);
+
+        // Toggle states - track which trajectory types are visible
+        let showHistory = true;
+        let showFutureGT = true;
+        let showPredictions = true;
+
+        // Leaflet map and layers
+        let map = null;
+        let vesselLayers = {{}};  // vessel_id -> {{past: [layers], future: [layers], prediction: [layers]}}
+
+        // Check if we have timeline data
+        const hasTimelineData = timelineData.length > 0 && totalTimesteps > 0;
+
+        console.log('📊 Data loaded:');
+        console.log('  Vessels:', vesselIds.length);
+        console.log('  Has timeline data:', hasTimelineData);
+        console.log('  Total timesteps:', totalTimesteps);
+        console.log('  Past length:', pastLen);
+        console.log('  Future length:', futureLen);
+        console.log('  Max current time:', maxCurrentTime);
 
         // Check if Leaflet loaded
         if (typeof L === 'undefined') {{
@@ -1334,7 +1528,7 @@ class EvaluationCallback(pl.Callback):
 
             try {{
                 // Initialize map - will auto-zoom to fit bounds tightly
-                const map = L.map('map').setView([{center_lat}, {center_lon}], 18);
+                map = L.map('map').setView([{center_lat}, {center_lon}], 18);
 
                 // Add OpenStreetMap tiles with MUCH higher zoom for detailed trajectory analysis
                 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
@@ -1343,18 +1537,414 @@ class EvaluationCallback(pl.Callback):
                     maxNativeZoom: 19  // OSM native max (will upscale beyond this)
                 }}).addTo(map);
 
-                const allLayers = [];
-                // Store layer groups per vessel for toggle control
-                const vesselLayerGroups = {{}};
-
-                // Initialize layer groups for each vessel
+                // Initialize vessel layer groups
                 vesselIds.forEach(function(vesselId) {{
-                    vesselLayerGroups[vesselId] = {{
+                    vesselLayers[vesselId] = {{
                         past: [],
-                        futureGT: [],
+                        future: [],
                         prediction: []
                     }};
                 }});
+
+                // Choose rendering mode: interactive timeline or static
+                if (hasTimelineData) {{
+                    console.log('🎬 Initializing INTERACTIVE timeline mode');
+                    initInteractiveTimeline();
+                }} else {{
+                    console.log('📸 Initializing STATIC snapshot mode');
+                    renderStaticSnapshot();
+                }}
+
+                console.log('✅ Scenario map initialized');
+
+            }} catch (error) {{
+                console.error('❌ Error initializing map:', error);
+                document.getElementById('map').innerHTML =
+                    '<div class="error">Error initializing map: ' + error.message + '</div>';
+            }}
+        }}
+
+        // ============= INTERACTIVE TIMELINE FUNCTIONS =============
+
+        function initInteractiveTimeline() {{
+            // Initial render
+            updateVisualization();
+            updateButtonStates();
+            document.getElementById('status').innerHTML = '✅ Interactive timeline loaded';
+            setTimeout(function() {{
+                document.getElementById('status').style.display = 'none';
+            }}, 2000);
+        }}
+
+        function updateVisualization() {{
+            console.log('🔄 Rendering frame at t=' + currentTime + 's');
+
+            // Clear existing layers
+            clearLayers();
+
+            // Calculate time windows
+            const pastStart = Math.max(0, currentTime);
+            const pastEnd = Math.min(currentTime + pastLen, totalTimesteps);
+            const futureStart = pastEnd;
+            const futureEnd = Math.min(pastEnd + futureLen, totalTimesteps);
+
+            const allLayers = [];
+
+            // Render each vessel
+            vesselIds.forEach(function(vesselId, idx) {{
+                if (!timelineData[idx]) return;
+
+                const vessel = timelineData[idx];
+                const vesselColor = vesselColors[idx];
+                const isPredicted = (vesselId === predictedVesselIdx);
+
+                // 1. PAST TRAJECTORY (solid line)
+                const pastCoords = vessel.positions.slice(pastStart, pastEnd);
+                if (pastCoords.length > 1) {{
+                    const pastLine = L.polyline(pastCoords, {{
+                        color: vesselColor,
+                        weight: isPredicted ? 8 : 5,
+                        opacity: 1.0,
+                        dashArray: ''
+                    }});
+
+                    pastLine.bindPopup(
+                        '<b>' + (isPredicted ? '🎯 ' : '') + 'Vessel ' + vesselId + ' - Past</b><br>' +
+                        'Time: t=' + pastStart + 's to t=' + (pastEnd-1) + 's<br>' +
+                        'Duration: ' + (pastEnd - pastStart) + 's'
+                    );
+
+                    // Only add to map if history is enabled
+                    if (showHistory) {{
+                        pastLine.addTo(map);
+                    }}
+
+                    vesselLayers[vesselId].past.push(pastLine);
+                    allLayers.push(pastLine);
+
+                    // Add position markers
+                    pastCoords.forEach(function(coord, i) {{
+                        const t = pastStart + i;
+                        const speed = vessel.speeds[t] || 0;
+                        const marker = L.circleMarker(coord, {{
+                            radius: isPredicted ? 6 : 4,
+                            fillColor: vesselColor,
+                            color: '#fff',
+                            weight: 2,
+                            opacity: 1,
+                            fillOpacity: 0.9
+                        }});
+
+                        marker.bindPopup(
+                            '<b>Vessel ' + vesselId + '</b><br>' +
+                            'Time: t=' + t + 's<br>' +
+                            'Lat: ' + coord[0].toFixed(6) + '<br>' +
+                            'Lon: ' + coord[1].toFixed(6) + '<br>' +
+                            'Speed: ' + speed.toFixed(2) + ' knots'
+                        );
+
+                        // Only add to map if history is enabled
+                        if (showHistory) {{
+                            marker.addTo(map);
+                        }}
+
+                        vesselLayers[vesselId].past.push(marker);
+                    }});
+                }}
+
+                // 2. FUTURE TRAJECTORY (dashed line - ground truth)
+                const futureCoords = vessel.positions.slice(futureStart, futureEnd);
+                if (futureCoords.length > 1) {{
+                    const futureLine = L.polyline(futureCoords, {{
+                        color: vesselColor,
+                        weight: isPredicted ? 8 : 5,
+                        opacity: 0.7,
+                        dashArray: '10, 5'
+                    }});
+
+                    futureLine.bindPopup(
+                        '<b>' + (isPredicted ? '🎯 ' : '') + 'Vessel ' + vesselId + ' - Future GT</b><br>' +
+                        'Time: t=' + futureStart + 's to t=' + (futureEnd-1) + 's<br>' +
+                        'Duration: ' + (futureEnd - futureStart) + 's'
+                    );
+
+                    // Only add to map if Future GT is enabled
+                    if (showFutureGT) {{
+                        futureLine.addTo(map);
+                    }}
+
+                    vesselLayers[vesselId].future.push(futureLine);
+                    allLayers.push(futureLine);
+
+                    // Add position markers
+                    futureCoords.forEach(function(coord, i) {{
+                        const t = futureStart + i;
+                        const speed = vessel.speeds[t] || 0;
+                        const marker = L.circleMarker(coord, {{
+                            radius: isPredicted ? 5 : 3,
+                            fillColor: vesselColor,
+                            color: '#fff',
+                            weight: 1,
+                            opacity: 1,
+                            fillOpacity: 0.7
+                        }});
+
+                        marker.bindPopup(
+                            '<b>Vessel ' + vesselId + ' (Future GT)</b><br>' +
+                            'Time: t=' + t + 's<br>' +
+                            'Lat: ' + coord[0].toFixed(6) + '<br>' +
+                            'Lon: ' + coord[1].toFixed(6) + '<br>' +
+                            'Speed: ' + speed.toFixed(2) + ' knots'
+                        );
+
+                        // Only add to map if Future GT is enabled
+                        if (showFutureGT) {{
+                            marker.addTo(map);
+                        }}
+
+                        vesselLayers[vesselId].future.push(marker);
+                    }});
+                }}
+
+                // 3. PREDICTION TRAJECTORY (dotted line - only for predicted vessel at initial window)
+                if (isPredicted && currentTime === initialWindowStart && predictionCoords.length > 0) {{
+                    const predLine = L.polyline(predictionCoords, {{
+                        color: vesselColor,
+                        weight: 8,
+                        opacity: 0.9,
+                        dashArray: '2, 5'
+                    }});
+
+                    predLine.bindPopup(
+                        '<b>🤖 Model Prediction</b><br>' +
+                        'From time: t=' + currentTime + 's<br>' +
+                        'Prediction length: ' + predictionCoords.length + ' points'
+                    );
+
+                    // Only add to map if predictions are enabled
+                    if (showPredictions) {{
+                        predLine.addTo(map);
+                    }}
+
+                    vesselLayers[vesselId].prediction.push(predLine);
+                    allLayers.push(predLine);
+
+                    // Add prediction markers
+                    predictionCoords.forEach(function(coord, i) {{
+                        const marker = L.circleMarker(coord, {{
+                            radius: 5,
+                            fillColor: vesselColor,
+                            color: '#000',
+                            weight: 2,
+                            opacity: 1,
+                            fillOpacity: 0.9
+                        }});
+
+                        marker.bindPopup(
+                            '<b>🎯 Prediction t+' + (i+1) + '</b><br>' +
+                            'Lat: ' + coord[0].toFixed(6) + '<br>' +
+                            'Lon: ' + coord[1].toFixed(6)
+                        );
+
+                        // Only add to map if predictions are enabled
+                        if (showPredictions) {{
+                            marker.addTo(map);
+                        }}
+
+                        vesselLayers[vesselId].prediction.push(marker);
+                    }});
+                }}
+            }});
+
+            // Fit map bounds
+            if (allLayers.length > 0) {{
+                const group = new L.featureGroup(allLayers);
+                map.fitBounds(group.getBounds().pad(0.1));
+            }}
+
+            // Update time display
+            updateTimeDisplay();
+        }}
+
+        function clearLayers() {{
+            vesselIds.forEach(function(vesselId) {{
+                ['past', 'future', 'prediction'].forEach(function(type) {{
+                    if (vesselLayers[vesselId] && vesselLayers[vesselId][type]) {{
+                        vesselLayers[vesselId][type].forEach(function(layer) {{
+                            map.removeLayer(layer);
+                        }});
+                        vesselLayers[vesselId][type] = [];
+                    }}
+                }});
+            }});
+        }}
+
+        function updateTimeDisplay() {{
+            const hours = Math.floor(currentTime / 3600);
+            const minutes = Math.floor((currentTime % 3600) / 60);
+            const seconds = currentTime % 60;
+            const timeStr = String(hours).padStart(2, '0') + ':' +
+                          String(minutes).padStart(2, '0') + ':' +
+                          String(seconds).padStart(2, '0');
+            document.getElementById('time-display').innerHTML =
+                'T = ' + currentTime + 's (' + timeStr + ')';
+        }}
+
+        function updateButtonStates() {{
+            document.getElementById('btn-first').disabled = (currentTime === 0);
+            document.getElementById('btn-prev').disabled = (currentTime === 0);
+            document.getElementById('btn-next').disabled = (currentTime >= maxCurrentTime);
+            document.getElementById('btn-last').disabled = (currentTime >= maxCurrentTime);
+            document.getElementById('time-slider').value = currentTime;
+        }}
+
+        function nextFrame() {{
+            if (currentTime < maxCurrentTime) {{
+                currentTime = Math.min(currentTime + stepSize, maxCurrentTime);
+                updateVisualization();
+                updateButtonStates();
+            }}
+        }}
+
+        function previousFrame() {{
+            if (currentTime > 0) {{
+                currentTime = Math.max(currentTime - stepSize, 0);
+                updateVisualization();
+                updateButtonStates();
+            }}
+        }}
+
+        function goToFirst() {{
+            currentTime = 0;
+            updateVisualization();
+            updateButtonStates();
+        }}
+
+        function goToLast() {{
+            currentTime = maxCurrentTime;
+            updateVisualization();
+            updateButtonStates();
+        }}
+
+        function onSliderChange(value) {{
+            currentTime = parseInt(value);
+            updateVisualization();
+            updateButtonStates();
+        }}
+
+        function updateStepSize() {{
+            stepSize = parseInt(document.getElementById('step-selector').value);
+            console.log('⏱️  Step size updated to:', stepSize, 'seconds');
+        }}
+
+        function togglePlay() {{
+            isPlaying = !isPlaying;
+            const btn = document.getElementById('btn-play');
+
+            if (isPlaying) {{
+                btn.innerHTML = '⏸️ Pause';
+                playInterval = setInterval(function() {{
+                    if (currentTime >= maxCurrentTime) {{
+                        togglePlay();
+                    }} else {{
+                        nextFrame();
+                    }}
+                }}, 500);
+            }} else {{
+                btn.innerHTML = '▶️ Play';
+                if (playInterval) {{
+                    clearInterval(playInterval);
+                    playInterval = null;
+                }}
+            }}
+        }}
+
+        // Global toggle functions for all vessels
+        function toggleAllHistory() {{
+            const btn = document.getElementById('btn-toggle-history');
+            const isActive = btn.classList.contains('active');
+
+            vesselIds.forEach(function(vesselId) {{
+                if (vesselLayers[vesselId] && vesselLayers[vesselId].past) {{
+                    vesselLayers[vesselId].past.forEach(function(layer) {{
+                        if (isActive) {{
+                            map.removeLayer(layer);
+                        }} else {{
+                            map.addLayer(layer);
+                        }}
+                    }});
+                }}
+            }});
+
+            btn.classList.toggle('active');
+            showHistory = !isActive;  // Update state
+            console.log('🔄 History toggled:', showHistory ? 'visible' : 'hidden');
+        }}
+
+        function toggleAllGT() {{
+            const btn = document.getElementById('btn-toggle-gt');
+            const isActive = btn.classList.contains('active');
+
+            vesselIds.forEach(function(vesselId) {{
+                if (vesselLayers[vesselId] && vesselLayers[vesselId].future) {{
+                    vesselLayers[vesselId].future.forEach(function(layer) {{
+                        if (isActive) {{
+                            map.removeLayer(layer);
+                        }} else {{
+                            map.addLayer(layer);
+                        }}
+                    }});
+                }}
+            }});
+
+            btn.classList.toggle('active');
+            showFutureGT = !isActive;  // Update state
+            console.log('🔄 Future GT toggled:', showFutureGT ? 'visible' : 'hidden');
+        }}
+
+        function toggleAllPredictions() {{
+            const btn = document.getElementById('btn-toggle-pred');
+            const isActive = btn.classList.contains('active');
+
+            vesselIds.forEach(function(vesselId) {{
+                if (vesselLayers[vesselId] && vesselLayers[vesselId].prediction) {{
+                    vesselLayers[vesselId].prediction.forEach(function(layer) {{
+                        if (isActive) {{
+                            map.removeLayer(layer);
+                        }} else {{
+                            map.addLayer(layer);
+                        }}
+                    }});
+                }}
+            }});
+
+            btn.classList.toggle('active');
+            showPredictions = !isActive;  // Update state
+            console.log('🔄 Predictions toggled:', showPredictions ? 'visible' : 'hidden');
+        }}
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', function(e) {{
+            if (!hasTimelineData) return;
+            if (e.key === 'ArrowRight') {{
+                e.preventDefault();
+                nextFrame();
+            }} else if (e.key === 'ArrowLeft') {{
+                e.preventDefault();
+                previousFrame();
+            }} else if (e.key === ' ') {{
+                e.preventDefault();
+                togglePlay();
+            }}
+        }});
+
+        // ============= STATIC SNAPSHOT FUNCTIONS =============
+
+        function renderStaticSnapshot() {{
+            const allLayers = [];
+
+            // Use global vesselLayers (already initialized)
+            // vesselLayers[vesselId] = {{ past: [], future: [], prediction: [] }}
 
                 // 1. PAST TRAJECTORIES (HISTORY) - SOLID LINES
                 allVesselsPast.forEach(function(vesselPast, idx) {{
@@ -1382,7 +1972,7 @@ class EvaluationCallback(pl.Callback):
 
                         pastLine.bindPopup(popupText);
                         allLayers.push(pastLine);
-                        vesselLayerGroups[vesselId].past.push(pastLine);
+                        vesselLayers[vesselId].past.push(pastLine);
 
                         // Add position markers (every point for maximum detail)
                         vesselPast.forEach(function(coord, i) {{
@@ -1401,7 +1991,7 @@ class EvaluationCallback(pl.Callback):
                                 fillOpacity: 0.9
                             }}).addTo(map)
                             .bindPopup(popupContent);
-                            vesselLayerGroups[vesselId].past.push(marker);
+                            vesselLayers[vesselId].past.push(marker);
                         }});
                     }}
                 }});
@@ -1432,7 +2022,7 @@ class EvaluationCallback(pl.Callback):
 
                         futureLine.bindPopup(futurePopupText);
                         allLayers.push(futureLine);
-                        vesselLayerGroups[vesselId].futureGT.push(futureLine);
+                        vesselLayers[vesselId].future.push(futureLine);
 
                         // Add position markers for ALL GT future points
                         vesselFuture.forEach(function(coord, i) {{
@@ -1451,7 +2041,7 @@ class EvaluationCallback(pl.Callback):
                                 fillOpacity: 0.8
                             }}).addTo(map)
                             .bindPopup(futurePopup);
-                            vesselLayerGroups[vesselId].futureGT.push(marker);
+                            vesselLayers[vesselId].future.push(marker);
                         }});
                     }}
                 }});
@@ -1543,7 +2133,7 @@ class EvaluationCallback(pl.Callback):
 
                 // Toggle functions for History, GT, and Predictions per vessel
                 window.toggleVesselHistory = function(vesselId) {{
-                    const layers = vesselLayerGroups[vesselId].past;
+                    const layers = vesselLayers[vesselId].past;
                     const btn = document.getElementById('toggle-history-' + vesselId);
                     const isActive = btn.classList.contains('active');
 
@@ -1559,7 +2149,7 @@ class EvaluationCallback(pl.Callback):
                 }};
 
                 window.toggleVesselGT = function(vesselId) {{
-                    const layers = vesselLayerGroups[vesselId].futureGT;
+                    const layers = vesselLayers[vesselId].future;
                     const btn = document.getElementById('toggle-gt-' + vesselId);
                     const isActive = btn.classList.contains('active');
 
@@ -1575,7 +2165,7 @@ class EvaluationCallback(pl.Callback):
                 }};
 
                 window.toggleVesselPrediction = function(vesselId) {{
-                    const layers = vesselLayerGroups[vesselId].prediction;
+                    const layers = vesselLayers[vesselId].prediction;
                     const btn = document.getElementById('toggle-pred-' + vesselId);
                     const isActive = btn.classList.contains('active');
 
@@ -1597,12 +2187,6 @@ class EvaluationCallback(pl.Callback):
                 }}, 3000);
 
                 console.log('✅ Scenario map initialized with ' + vesselIds.length + ' vessels');
-
-            }} catch (error) {{
-                console.error('❌ Error initializing map:', error);
-                document.getElementById('map').innerHTML =
-                    '<div class="error">Error initializing map: ' + error.message + '</div>';
-            }}
         }}
 
         window.addEventListener('error', function(e) {{
