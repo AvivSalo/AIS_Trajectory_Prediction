@@ -907,6 +907,11 @@ class EvaluationCallback(pl.Callback):
 
             if pickle_data is not None:
                 logger.info(f"✅ Using original pickle data for absolute positions (window start: t={window_start_idx})")
+                # Override ref_lat/ref_lon directly from pickle - most reliable source
+                if 'reference_lat' in pickle_data and 'reference_lon' in pickle_data:
+                    ref_lat = float(pickle_data['reference_lat'])
+                    ref_lon = float(pickle_data['reference_lon'])
+                    logger.info(f"✅ Reference coordinates from pickle: ({ref_lat:.6f}, {ref_lon:.6f})")
                 tracks = pickle_data['tracks']
                 track_ids = list(tracks.keys())
 
