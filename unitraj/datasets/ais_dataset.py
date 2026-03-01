@@ -288,6 +288,13 @@ class AISDataset(Dataset):
             ego_positions = positions[start_idx:end_idx]
             ego_velocities = velocities[start_idx:end_idx]
 
+            # Skip windows with physically impossible position jumps (corrupted AIS data).
+            # Vessels max out at ~30 knots (~15 m/s); 500 m/timestep is an unambiguous
+            # corruption signal (e.g., two vessel tracks merged under the same MMSI).
+            _step_dist = np.linalg.norm(np.diff(ego_positions, axis=0), axis=1)
+            if _step_dist.max() > 500.0:
+                continue
+
             # CRITICAL FIX: Recenter coordinates relative to ego position at LAST PAST TIMESTEP
             # This matches Waymo/nuScenes convention: current_time_index is the reference (present moment)
             # Past and future are both relative to this "current" position

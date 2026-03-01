@@ -280,6 +280,9 @@
         let showFutureGT = true;
         let showPredictions = true;
 
+        // Zoom preservation: only auto-fit bounds on the first render
+        let initialFitDone = false;
+
         // Leaflet map and layers
         let map = null;
         let vesselLayers = {{}};  // vessel_id -> {{past: [layers], future: [layers], prediction: [layers]}}
@@ -532,10 +535,11 @@
                 }}
             }});
 
-            // Fit map bounds
-            if (allLayers.length > 0) {{
+            // Fit map bounds only on first render; preserve user zoom after that
+            if (allLayers.length > 0 && !initialFitDone) {{
                 const group = new L.featureGroup(allLayers);
                 map.fitBounds(group.getBounds().pad(0.1));
+                initialFitDone = true;
             }}
 
             // Update time display

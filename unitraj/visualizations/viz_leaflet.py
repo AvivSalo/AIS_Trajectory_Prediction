@@ -1,0 +1,2272 @@
+"""
+Leaflet-based HTML visualization for maritime trajectory prediction.
+"""
+import numpy as np
+import os
+import json
+import logging
+from typing import Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+
+class LeafletVisualizer:
+    """Generates Leaflet-based interactive HTML visualizations for maritime scenarios."""
+
+    def __init__(self, config=None, output_dir=None):
+        self.config = config
+        self.output_dir = output_dir
+
+    def _get_reference_coordinates_from_csv(self, scenario_id):
+        """
+        Extract reference coordinates from original CSV file.
+        The reference point is the first valid own_latitude/own_longitude in the CSV.
+
+        Args:
+            scenario_id: Scenario ID like "ais_arc-integrity_20250315_060000"
+
+        Returns:
+            Tuple of (reference_lat, reference_lon) or None if not found
+        """
+        try:
+            import pandas as pd
+            from pathlib import Path
+
+            # Parse scenario_id to extract vessel name and timestamp
+            # Format: ais_{vessel_name}_{YYYYMMDD}_{HHMMSS}_t{offset} or ais_{vessel_name}_{YYYYMMDD}_{HHMMSS}
+            if not scenario_id.startswith('ais_'):
+                logger.warning(f"Unexpected scenario_id format: {scenario_id}")
+                return None
+
+            # Remove time offset suffix if present (e.g., _t0, _t300, _t3900)
+            scenario_id_base = scenario_id
+            if '_t' in scenario_id:
+                # Find the last occurrence of _t followed by digits
+                import re
+                match = re.match(r'(.*?)_t\d+$', scenario_id)
+                if match:
+                    scenario_id_base = match.group(1)
+
+            parts = scenario_id_base.replace('ais_', '').split('_')
+            if len(parts) < 3:
+                logger.warning(f"Cannot parse scenario_id: {scenario_id}")
+                return None
+
+            # Reconstruct vessel name (everything except last 2 parts which are date and time)
+            vessel_name = '_'.join(parts[:-2])
+            date_str = parts[-2]  # YYYYMMDD
+
+            # Convert date format: 20250315 -> 2025-03-15
+            if len(date_str) == 8 and date_str.isdigit():
+                formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+            else:
+                logger.warning(f"Unexpected date format in scenario_id: {date_str}")
+                return None
+
+            # Construct CSV filename: kepler_{vessel_name}_{YYYY-MM-DD}_{YYYY-MM-DD}_part-1.csv
+            csv_filename = f"kepler_{vessel_name}_{formatted_date}_{formatted_date}_part-1.csv"
+
+            # Look for CSV in data directory
+            csv_dir = Path(__file__).parent.parent.parent / "data" / "ais_data_from_influx_csv"
+            csv_path = csv_dir / csv_filename
+
+            if not csv_path.exists():
+                logger.warning(f"CSV file not found: {csv_path}")
+                return None
+
+            # Read CSV and extract first valid row
+            df = pd.read_csv(csv_path)
+
+            # Get first row with valid coordinates
+            for _, row in df.iterrows():
+                if 'own_latitude' in row and 'own_longitude' in row:
+                    lat = row['own_latitude']
+                    lon = row['own_longitude']
+                    if not (pd.isna(lat) or pd.isna(lon)):
+                        logger.info(f"Found reference coordinates from {csv_filename}: lat={lat:.6f}, lon={lon:.6f}")
+                        return float(lat), float(lon)
+
+            logger.warning(f"No valid coordinates found in {csv_filename}")
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to extract reference coordinates from CSV for {scenario_id}: {str(e)}")
+            return None
+
+    def _get_reference_coordinates_from_pickle(self, scenario_id):
+        """
+        Extract reference coordinates directly from pickle file.
+
+        Args:
+            scenario_id: Scenario ID like "ais_arc-integrity_20250315_060000"
+
+        Returns:
+            Tuple of (reference_lat, reference_lon) or None if not found
+        """
+        try:
+            import pickle
+            from pathlib import Path
+
+            # Try to find the pickle file in data paths
+            if self.config is not None and 'val_data_path' in self.config:
+                val_paths = self.config['val_data_path']
+                if not isinstance(val_paths, list):
+                    val_paths = [val_paths]
+
+                for val_path in val_paths:
+                    # Look for scenario directory and pickle file
+                    scenario_dir = Path(val_path) / scenario_id
+                    pkl_path = scenario_dir / f"{scenario_id}.pkl"
+
+                    if pkl_path.exists():
+                        with open(pkl_path, 'rb') as f:
+                            data = pickle.load(f)
+
+                        # Check if reference coordinates are in the pickle
+                        if 'reference_lat' in data and 'reference_lon' in data:
+                            ref_lat = float(data['reference_lat'])
+                            ref_lon = float(data['reference_lon'])
+                            logger.info(f"Found reference coordinates from pickle: lat={ref_lat:.6f}, lon={ref_lon:.6f}")
+                            return ref_lat, ref_lon
+                        else:
+                            logger.warning(f"Pickle file found but no reference coordinates: {pkl_path}")
+                            return None
+
+            logger.warning(f"Could not find pickle file for scenario: {scenario_id}")
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to extract reference coordinates from pickle for {scenario_id}: {str(e)}")
+            return None
+
+    def create_maritime_scene_visualization(self, scenario_id, scene_obj_trajs, scene_obj_mask,
+                                           pred_trajs_latlon, gt_trajs_latlon, pl_module):
+        """
+        Create individual maritime scene visualization with ALL vessels from one pickle file
+        Each scene represents a different geographic location with multiple vessels
+
+        Now uses the enhanced visualization utilities to separate past, GT future, and predicted trajectories.
+        """
+        try:
+            # Import visualization utilities
+            import sys
+            import os
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools'))
+            from ais_visualization_utils.trajectory_viz import (
+                split_trajectory,
+                convert_xy_to_latlon,
+                extract_trajectory_coordinates,
+                create_html_visualization
+            )
+            import math
+
+            # Get vessel trajectories from obj_trajs for this scene
+            valid_agents = scene_obj_mask.sum(dim=1) > 0  # agents with at least one valid timestep
+            valid_scene_trajs = scene_obj_trajs[valid_agents]  # [num_valid_agents, timesteps, features]
+
+            if len(valid_scene_trajs) == 0:
+                logger.warning(f"No valid agents found in scenario {scenario_id}")
+                return
+
+            # Get correct reference coordinates - try pickle first, then CSV, then fallback
+            ref_coords = self._get_reference_coordinates_from_pickle(scenario_id)
+            if ref_coords is None:
+                ref_coords = self._get_reference_coordinates_from_csv(scenario_id)
+
+            if ref_coords is not None:
+                reference_lat, reference_lon = ref_coords
+                logger.info(f"Using reference coordinates for {scenario_id}: lat={reference_lat:.6f}, lon={reference_lon:.6f}")
+            else:
+                # Fallback to default (Mediterranean center) if neither pickle nor CSV available
+                reference_lat, reference_lon = 31.833351, 34.618101
+                logger.warning(f"Using fallback reference coordinates for {scenario_id}")
+
+            # Get past_len from config (default 21)
+            past_len = 21
+            if hasattr(pl_module, 'config') and 'past_len' in pl_module.config:
+                past_len = pl_module.config['past_len']
+
+            # Extract past and future ground truth coordinates using utility function
+            past_coords_list = []
+            future_gt_coords_list = []
+            valid_agent_indices = torch.where(scene_obj_mask.sum(dim=1) > 0)[0].cpu().numpy()
+
+            for i, agent_idx in enumerate(valid_agent_indices):
+                agent_traj = scene_obj_trajs[agent_idx]  # [timesteps, features]
+
+                # Split into past and future using utility function
+                past_traj, future_traj = split_trajectory(agent_traj, past_len)
+
+                # Extract XY coordinates for past
+                past_xy = past_traj[:, 0:2].cpu().numpy()  # [past_len, 2]
+                # Filter out invalid past coordinates
+                valid_past_mask = ~np.isnan(past_xy).any(axis=1) & (past_xy != 0).any(axis=1)
+                if not valid_past_mask.any():
+                    continue
+                past_xy = past_xy[valid_past_mask]
+
+                # Convert past trajectory to lat/lon
+                past_coords = []
+                for x, y in past_xy:
+                    lat, lon = convert_xy_to_latlon(np.array([x, y]), reference_lat, reference_lon)
+                    past_coords.append([lat, lon])
+                past_coords_list.append(past_coords)
+
+                # Extract XY coordinates for future GT
+                future_xy = future_traj[:, 0:2].cpu().numpy()  # [future_len, 2]
+                # Filter out invalid future coordinates
+                valid_future_mask = ~np.isnan(future_xy).any(axis=1) & (future_xy != 0).any(axis=1)
+                if not valid_future_mask.any():
+                    future_gt_coords_list.append([])
+                    continue
+                future_xy = future_xy[valid_future_mask]
+
+                # Convert future GT trajectory to lat/lon
+                future_gt_coords = []
+                for x, y in future_xy:
+                    lat, lon = convert_xy_to_latlon(np.array([x, y]), reference_lat, reference_lon)
+                    future_gt_coords.append([lat, lon])
+                future_gt_coords_list.append(future_gt_coords)
+
+            # Get predictions for ego agent and convert to lat/lon
+            scene_pred_coords = []
+            if len(pred_trajs_latlon) > 0 and len(pred_trajs_latlon[0]) > 0:
+                pred_batch = pred_trajs_latlon[0]  # [timesteps, 2] - single agent prediction (relative meters)
+                pred_coords = pred_batch if isinstance(pred_batch, np.ndarray) else pred_batch.cpu().numpy()
+
+                # Convert predictions from relative meters to lat/lon
+                pred_latlon = []
+                for x, y in pred_coords:
+                    lat, lon = convert_xy_to_latlon(np.array([x, y]), reference_lat, reference_lon)
+                    pred_latlon.append([lat, lon])
+                pred_coords = np.array(pred_latlon)
+
+                # Filter out invalid predictions
+                valid_pred_mask = ~np.isnan(pred_coords).any(axis=1) & (pred_coords != 0).any(axis=1)
+                if valid_pred_mask.any():
+                    # Add prediction for ego vessel (agent 0)
+                    scene_pred_coords.append(pred_coords[valid_pred_mask].tolist())
+                    # Add empty predictions for other agents until we implement multi-agent prediction
+                    for _ in range(1, len(valid_agent_indices)):
+                        scene_pred_coords.append([])
+                else:
+                    # Add empty predictions for all agents
+                    for _ in range(len(valid_agent_indices)):
+                        scene_pred_coords.append([])
+            else:
+                # Add empty predictions for all agents
+                for _ in range(len(valid_agent_indices)):
+                    scene_pred_coords.append([])
+
+            # Calculate map center from all valid coordinates
+            all_coords = []
+            for coords_list in past_coords_list:
+                all_coords.extend(coords_list)
+            for coords_list in future_gt_coords_list:
+                all_coords.extend(coords_list)
+            for coords_list in scene_pred_coords:
+                all_coords.extend(coords_list)
+
+            if not all_coords:
+                logger.warning(f"No valid coordinates found for scenario {scenario_id}")
+                return
+
+            center_lat = np.mean([coord[0] for coord in all_coords])
+            center_lon = np.mean([coord[1] for coord in all_coords])
+
+            # Create HTML visualization using utility function
+            html_path = os.path.join(self.output_dir, f"{scenario_id}.html")
+            create_html_visualization(
+                scenario_id=scenario_id,
+                past_coords_list=past_coords_list,
+                future_gt_coords_list=future_gt_coords_list,
+                pred_coords_list=scene_pred_coords,
+                center_lat=center_lat,
+                center_lon=center_lon,
+                output_path=html_path
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to create maritime scene visualization for {scenario_id}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    def create_individual_html_visualization(self, scenario_id, gt_coords_list, pred_coords_list, center_lat, center_lon):
+        """Create HTML file for individual maritime scene with multiple vessels"""
+        try:
+            html_filename = f"{scenario_id}.html"
+            html_path = os.path.join(self.output_dir, html_filename)
+
+            # Generate vessel colors
+            colors = ['#228B22', '#4169E1', '#DC143C', '#FF8C00', '#9932CC', '#FF1493', '#00CED1', '#32CD32']
+
+            html_content = f'''<!DOCTYPE html>
+<html>
+<head>
+    <title>Maritime Scene: {scenario_id}</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet-polylinedecorator@1.6.0/dist/leaflet.polylineDecorator.css" />
+    <style>
+        body {{ margin: 0; font-family: Arial, sans-serif; }}
+        #map {{ height: 100vh; }}
+        .legend {{
+            background: white;
+            padding: 10px;
+            border-radius: 5px;
+            box-shadow: 0 0 15px rgba(0,0,0,0.2);
+            font-size: 14px;
+        }}
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet-polylinedecorator@1.6.0/dist/leaflet.polylineDecorator.js"></script>
+    <script>
+        var map = L.map('map').setView([{center_lat}, {center_lon}], 10);
+
+        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            attribution: '&copy; OpenStreetMap contributors'
+        }}).addTo(map);
+
+        var allLayers = [];
+        var bounds = L.latLngBounds();
+
+        // Add vessels
+        var vesselColors = {colors};
+        var vesselCount = 0;
+'''
+
+            # Add ground truth trajectories for all vessels
+            for vessel_idx, gt_coords in enumerate(gt_coords_list):
+                if len(gt_coords) > 0:
+                    color = colors[vessel_idx % len(colors)]
+                    # Convert numpy types to native Python types for JSON serialization
+                    gt_coords_clean = [[float(coord[0]), float(coord[1])] for coord in gt_coords]
+                    gt_coords_json = json.dumps(gt_coords_clean)
+
+                    html_content += f'''
+        // Vessel {vessel_idx + 1} Ground Truth
+        var vessel{vessel_idx}_gt_coords = {gt_coords_json};
+        if (vessel{vessel_idx}_gt_coords.length > 0) {{
+            var vessel{vessel_idx}_gt_line = L.polyline(vessel{vessel_idx}_gt_coords, {{
+                color: '{color}',
+                weight: 3,
+                opacity: 0.8
+            }}).addTo(map);
+            vessel{vessel_idx}_gt_line.bindPopup('<b>Vessel {vessel_idx + 1} - Ground Truth</b><br>Scene: {scenario_id}<br>Actual path from AIS data');
+            allLayers.push(vessel{vessel_idx}_gt_line);
+
+            // Add direction arrows to ground truth
+            var vessel{vessel_idx}_gt_arrows = L.polylineDecorator(vessel{vessel_idx}_gt_line, {{
+                patterns: [
+                    {{
+                        offset: '10%',
+                        repeat: '15%',
+                        symbol: L.Symbol.arrowHead({{
+                            pixelSize: 12,
+                            polygon: false,
+                            pathOptions: {{
+                                stroke: true,
+                                weight: 2,
+                                color: '{color}',
+                                opacity: 0.8
+                            }}
+                        }})
+                    }}
+                ]
+            }}).addTo(map);
+
+            // Add start/end markers
+            var startMarker = L.circleMarker(vessel{vessel_idx}_gt_coords[0], {{
+                radius: 6,
+                fillColor: '{color}',
+                color: '#fff',
+                weight: 2,
+                opacity: 1,
+                fillOpacity: 0.9
+            }}).addTo(map)
+            .bindPopup('<b>Vessel {vessel_idx + 1} Start</b><br>Lat: ' + vessel{vessel_idx}_gt_coords[0][0].toFixed(6) + '<br>Lon: ' + vessel{vessel_idx}_gt_coords[0][1].toFixed(6));
+
+            var endMarker = L.circleMarker(vessel{vessel_idx}_gt_coords[vessel{vessel_idx}_gt_coords.length-1], {{
+                radius: 6,
+                fillColor: '{color}',
+                color: '#000',
+                weight: 2,
+                opacity: 1,
+                fillOpacity: 0.9
+            }}).addTo(map)
+            .bindPopup('<b>Vessel {vessel_idx + 1} End</b><br>Lat: ' + vessel{vessel_idx}_gt_coords[vessel{vessel_idx}_gt_coords.length-1][0].toFixed(6) + '<br>Lon: ' + vessel{vessel_idx}_gt_coords[vessel{vessel_idx}_gt_coords.length-1][1].toFixed(6));
+
+            vessel{vessel_idx}_gt_coords.forEach(function(coord) {{ bounds.extend(coord); }});
+        }}
+'''
+
+            # Add prediction trajectories
+            for vessel_idx, pred_coords in enumerate(pred_coords_list):
+                if len(pred_coords) > 0:
+                    color = colors[vessel_idx % len(colors)]
+                    # Convert numpy types to native Python types for JSON serialization
+                    pred_coords_clean = [[float(coord[0]), float(coord[1])] for coord in pred_coords]
+                    pred_coords_json = json.dumps(pred_coords_clean)
+
+                    html_content += f'''
+        // Vessel {vessel_idx + 1} Predictions
+        var vessel{vessel_idx}_pred_coords = {pred_coords_json};
+        if (vessel{vessel_idx}_pred_coords.length > 0) {{
+            var vessel{vessel_idx}_pred_line = L.polyline(vessel{vessel_idx}_pred_coords, {{
+                color: '{color}',
+                weight: 3,
+                opacity: 0.6,
+                dashArray: '10, 5'
+            }}).addTo(map);
+            vessel{vessel_idx}_pred_line.bindPopup('<b>Vessel {vessel_idx + 1} - Prediction</b><br>Scene: {scenario_id}<br>Wayformer predicted path');
+            allLayers.push(vessel{vessel_idx}_pred_line);
+
+            // Add direction arrows to predictions
+            var vessel{vessel_idx}_pred_arrows = L.polylineDecorator(vessel{vessel_idx}_pred_line, {{
+                patterns: [
+                    {{
+                        offset: '10%',
+                        repeat: '15%',
+                        symbol: L.Symbol.arrowHead({{
+                            pixelSize: 10,
+                            polygon: false,
+                            pathOptions: {{
+                                stroke: true,
+                                weight: 2,
+                                color: '{color}',
+                                opacity: 0.6
+                            }}
+                        }})
+                    }}
+                ]
+            }}).addTo(map);
+
+            vessel{vessel_idx}_pred_coords.forEach(function(coord) {{ bounds.extend(coord); }});
+        }}
+'''
+
+            html_content += f'''
+        // Fit map to show all trajectories
+        if (bounds.isValid()) {{
+            map.fitBounds(bounds, {{padding: [20, 20]}});
+        }}
+
+        // Add legend
+        var legend = L.control({{position: 'topright'}});
+        legend.onAdd = function (map) {{
+            var div = L.DomUtil.create('div', 'legend');
+            div.innerHTML = '<h4>Maritime Scene: {scenario_id}</h4>' +
+                           '<p><strong>Vessels:</strong> {len(gt_coords_list)}</p>' +
+                           '<p><span style="color: #228B22;">━━━</span> Ground Truth</p>' +
+                           '<p><span style="color: #228B22;">┅┅┅</span> Predictions</p>' +
+                           '<p><strong>● Start</strong> | <strong>● End</strong></p>';
+            return div;
+        }};
+        legend.addTo(map);
+
+    </script>
+</body>
+</html>'''
+
+            with open(html_path, 'w') as f:
+                f.write(html_content)
+
+            logger.info(f"Created maritime scene visualization: {html_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to create HTML visualization for {scenario_id}: {str(e)}")
+
+    def _convert_xy_to_latlon(self, xy_coords: np.ndarray, reference_lat: float, reference_lon: float) -> np.ndarray:
+        """
+        Convert relative x/y coordinates (meters) back to lat/lon
+
+        Reverses the conversion from AIS dataset:
+        x = lon_diff * 111320 * cos(reference_lat)
+        y = lat_diff * 110540
+
+        Args:
+            xy_coords: Array of shape [batch_size, time_steps, 2] with x/y coordinates in meters
+            reference_lat: Reference latitude for conversion
+            reference_lon: Reference longitude for conversion
+
+        Returns:
+            Array of shape [batch_size, time_steps, 2] with lat/lon coordinates
+        """
+        import math
+
+        latlon_coords = np.zeros_like(xy_coords, dtype=np.float64)
+
+        for batch_idx in range(xy_coords.shape[0]):
+            for time_idx in range(xy_coords.shape[1]):
+                x = float(xy_coords[batch_idx, time_idx, 0])  # meters
+                y = float(xy_coords[batch_idx, time_idx, 1])  # meters
+
+                # Reverse the conversion with proper precision
+                lat_diff = y / 110540.0  # Convert y back to lat difference
+                lon_diff = x / (111320.0 * math.cos(math.radians(reference_lat)))  # Convert x back to lon difference
+
+                lat = reference_lat + lat_diff
+                lon = reference_lon + lon_diff
+
+                latlon_coords[batch_idx, time_idx, 0] = lat
+                latlon_coords[batch_idx, time_idx, 1] = lon
+
+        return latlon_coords
+
+    def _meters_to_latlon(self, x_meters: float, y_meters: float, ref_lat: float, ref_lon: float) -> tuple:
+        """Convert relative meters to lat/lon using reference point.
+
+        WARNING: This function expects ABSOLUTE coordinates in METERS, not normalized values!
+        If you're passing model outputs, make sure to:
+        1. Denormalize: multiply by position_scale (e.g., 100.0)
+        2. Add absolute offset: add ego_last_abs_x/y from pickle data
+        3. Then pass to this function
+        """
+        import math
+
+        # VALIDATION: Detect if normalized values are accidentally passed
+        # Maritime trajectories typically span 10-1000+ meters
+        # If values are < 1.0, they're likely normalized values that need transformation
+        if abs(x_meters) < 1.0 and abs(y_meters) < 1.0:
+            logger.warning(
+                f"COORDINATE WARNING: Values look like NORMALIZED coordinates, not meters!\n"
+                f"   Received: x={x_meters:.6f}, y={y_meters:.6f}\n"
+                f"   Expected: absolute coordinates in meters (typically 10-1000+ meters)\n"
+                f"   If these are model outputs, you must:\n"
+                f"     1. Denormalize: multiply by position_scale (e.g., 100.0)\n"
+                f"     2. Add offset: add ego_last_abs_x/y from pickle data\n"
+                f"     3. Then convert to lat/lon\n"
+                f"   This will cause spatial offset in visualization!"
+            )
+
+        # Conversion factors
+        meters_per_deg_lat = 110540.0
+        meters_per_deg_lon = 111320.0 * math.cos(math.radians(ref_lat))
+
+        lat_diff = y_meters / meters_per_deg_lat
+        lon_diff = x_meters / meters_per_deg_lon
+
+        lat = ref_lat + lat_diff
+        lon = ref_lon + lon_diff
+
+        return lat, lon
+
+    def _load_original_pickle_data(self, scenario_id: str) -> Optional[Dict]:
+        """Load original pickle file to get absolute positions of all vessels."""
+        import pickle
+        from pathlib import Path
+
+        if self.config is None:
+            return None
+
+        # Remove time offset suffix if present (e.g., _t0, _t300)
+        scenario_id_base = scenario_id
+        if '_t' in scenario_id:
+            import re
+            match = re.match(r'(.*?)_t\d+$', scenario_id)
+            if match:
+                scenario_id_base = match.group(1)
+
+        # Search for pickle file in val data paths
+        val_paths = self.config.get('val_data_path', [])
+        if isinstance(val_paths, str):
+            val_paths = [val_paths]
+
+        for data_path in val_paths:
+            data_path_obj = Path(data_path)
+
+            # Try multiple search patterns:
+            # 1. Standard structure: data_path/scenario_id/scenario_id.pkl
+            pickle_path = data_path_obj / scenario_id_base / f"{scenario_id_base}.pkl"
+            if pickle_path.exists():
+                try:
+                    with open(pickle_path, 'rb') as f:
+                        pickle_data = pickle.load(f)
+                        # Verify this pickle contains our scenario
+                        if pickle_data.get('scenario_id') == scenario_id_base or pickle_data.get('scenario_id', '').startswith(scenario_id_base):
+                            logger.info(f"Found pickle file: {pickle_path}")
+                            return pickle_data
+                except Exception as e:
+                    logger.warning(f"Failed to load pickle file {pickle_path}: {e}")
+
+            # 2. Search all subdirectories for any .pkl files
+            if data_path_obj.exists():
+                for pkl_file in data_path_obj.rglob("*.pkl"):
+                    # Skip summary files
+                    if pkl_file.name in ['dataset_summary.pkl', 'dataset_mapping.pkl', 'file_list.pkl']:
+                        continue
+                    try:
+                        with open(pkl_file, 'rb') as f:
+                            pickle_data = pickle.load(f)
+                            # Check if this pickle contains our scenario
+                            if isinstance(pickle_data, dict) and 'scenario_id' in pickle_data:
+                                pkl_scenario_id = pickle_data['scenario_id']
+                                if pkl_scenario_id == scenario_id_base or pkl_scenario_id.startswith(scenario_id_base):
+                                    logger.info(f"Found matching pickle file: {pkl_file}")
+                                    return pickle_data
+                    except Exception as e:
+                        continue
+
+        logger.warning(f"Could not find original pickle file for scenario: {scenario_id}")
+        return None
+
+    def create_visualization(
+        self,
+        predictions: np.ndarray,
+        ground_truth: np.ndarray,
+        scenario_id: str,
+        output_dir: str,
+        output_filename: str,
+        metrics: Optional[Dict[str, float]] = None,
+        scene_context: Optional[Dict] = None
+    ) -> str:
+        """
+        Create Leaflet-based HTML visualization for a single scenario
+
+        Args:
+            predictions: Model predictions array [1, future_len, 2] in XY meters
+            ground_truth: Ground truth array [1, future_len, 2] in XY meters
+            scenario_id: Scenario identifier
+            output_dir: Output directory
+            output_filename: Output HTML filename
+            metrics: Optional evaluation metrics
+
+        Returns:
+            Path to generated HTML file
+        """
+        # Get reference coordinates for this scenario - try pickle first, then CSV, then fallback
+        ref_coords = self._get_reference_coordinates_from_pickle(scenario_id)
+        if ref_coords is None:
+            ref_coords = self._get_reference_coordinates_from_csv(scenario_id)
+
+        if ref_coords is None:
+            # Fallback to default location if neither pickle nor CSV lookup succeeds
+            ref_lat, ref_lon = -34.755450, 22.990367
+            print(f"Warning: Could not find reference coordinates for {scenario_id}, using fallback")
+        else:
+            ref_lat, ref_lon = ref_coords
+
+        # Define color palette for multiple vessels
+        vessel_colors = [
+            '#228B22',  # Forest green
+            '#FF4500',  # Orange red
+            '#4169E1',  # Royal blue
+            '#FFD700',  # Gold
+            '#8B008B',  # Dark magenta
+            '#00CED1',  # Dark turquoise
+            '#FF1493',  # Deep pink
+            '#32CD32',  # Lime green
+            '#FF6347',  # Tomato
+            '#4682B4',  # Steel blue
+            '#DA70D6',  # Orchid
+            '#00FA9A',  # Medium spring green
+        ]
+
+        # Process multi-agent scene or single agent
+        predicted_idx = 0  # Default value
+
+        if scene_context is not None:
+            # Multi-agent mode: extract all vessels
+            obj_trajs = scene_context['obj_trajs']  # [num_agents, past_len, features]
+            obj_mask = scene_context['obj_mask']    # [num_agents, past_len]
+            predicted_idx = scene_context['track_idx']  # Which agent is being predicted
+            past_traj = scene_context.get('past_traj')  # [past_len, 2] - ego vessel past trajectory
+            reference_position = scene_context.get('reference_position', np.zeros(2))  # [2] - centering offset
+            future_gt = scene_context.get('future_gt')  # [num_agents, future_len, 2]
+            future_gt_mask = scene_context.get('future_gt_mask')  # [num_agents, future_len]
+
+            num_agents = obj_trajs.shape[0]
+            past_len = obj_trajs.shape[1]  # Timesteps in past (should be 21)
+
+            logger.info(f"Loading original pickle data for absolute vessel positions")
+
+            # Load original pickle data to get absolute positions
+            pickle_data = self._load_original_pickle_data(scenario_id)
+
+            # Store all vessel trajectories SPLIT INTO PAST AND FUTURE
+            all_vessel_past_coords = []  # Past (observed) trajectories
+            all_vessel_future_coords = []  # Future GT trajectories
+            all_vessel_ids = []
+            all_vessel_speeds = []  # Speed statistics for each vessel: [past_speed, future_speed]
+            predicted_vessel_color = vessel_colors[0]  # Default
+
+            # Extract window start index from scenario_id (e.g., _t0, _t300)
+            window_start_idx = 0
+            if '_t' in scenario_id:
+                import re
+                match = re.search(r'_t(\d+)$', scenario_id)
+                if match:
+                    window_start_idx = int(match.group(1))
+
+            # Prepare ALL vessel timeline data for interactive navigation
+            all_vessel_timeline_data = []  # Full timeline data for JavaScript
+            total_timesteps = 0
+
+            if pickle_data is not None:
+                logger.info(f"Using original pickle data for absolute positions (window start: t={window_start_idx})")
+                # Override ref_lat/ref_lon directly from pickle - most reliable source
+                if 'reference_lat' in pickle_data and 'reference_lon' in pickle_data:
+                    ref_lat = float(pickle_data['reference_lat'])
+                    ref_lon = float(pickle_data['reference_lon'])
+                    logger.info(f"Reference coordinates from pickle: ({ref_lat:.6f}, {ref_lon:.6f})")
+                tracks = pickle_data['tracks']
+                track_ids = list(tracks.keys())
+
+                # Get total timeline length from first vessel
+                if len(track_ids) > 0:
+                    first_track = tracks[track_ids[0]]
+                    total_timesteps = len(first_track['state']['position'])
+                    logger.info(f"Total timeline: {total_timesteps} timesteps (~{total_timesteps/3600:.1f} hours)")
+
+                for agent_idx in range(min(num_agents, len(track_ids))):
+                    track_id = track_ids[agent_idx]
+                    track_data = tracks[track_id]
+                    positions = track_data['state']['position']  # Absolute scenario-relative positions
+                    velocities = track_data['state']['velocity']  # [vx, vy] in m/s
+
+                    # Convert ALL positions to lat/lon for interactive timeline
+                    all_positions_latlon = []
+                    all_speeds_knots = []
+                    for t in range(len(positions)):
+                        x, y = positions[t]
+                        lat, lon = self._meters_to_latlon(float(x), float(y), ref_lat, ref_lon)
+                        all_positions_latlon.append([float(lat), float(lon)])
+
+                        vx, vy = velocities[t]
+                        speed_ms = np.sqrt(vx**2 + vy**2)
+                        speed_knots = speed_ms * 1.94384
+                        all_speeds_knots.append(float(speed_knots))
+
+                    all_vessel_timeline_data.append({
+                        'positions': all_positions_latlon,
+                        'speeds': all_speeds_knots
+                    })
+
+                    # Extract positions for this window (for initial static view)
+                    past_start = window_start_idx
+                    past_end = window_start_idx + past_len
+                    future_end = past_end + (future_gt.shape[1] if future_gt is not None else 5)
+
+                    # PAST trajectories - use absolute positions from pickle
+                    past_coords = []
+                    past_speeds = []  # speeds for each past timestep
+                    for t in range(past_start, min(past_end, len(positions))):
+                        x, y = positions[t]
+                        lat, lon = self._meters_to_latlon(float(x), float(y), ref_lat, ref_lon)
+                        past_coords.append([lat, lon])
+
+                        # Calculate speed from velocity components
+                        vx, vy = velocities[t]
+                        speed_ms = np.sqrt(vx**2 + vy**2)
+                        speed_knots = speed_ms * 1.94384  # Convert m/s to knots
+                        past_speeds.append(float(speed_knots))
+
+                    # FUTURE trajectories - use absolute positions from pickle
+                    future_coords = []
+                    future_speeds = []  # speeds for each future timestep
+                    for t in range(past_end, min(future_end, len(positions))):
+                        x, y = positions[t]
+                        lat, lon = self._meters_to_latlon(float(x), float(y), ref_lat, ref_lon)
+                        future_coords.append([lat, lon])
+
+                        # Calculate speed from velocity components
+                        vx, vy = velocities[t]
+                        speed_ms = np.sqrt(vx**2 + vy**2)
+                        speed_knots = speed_ms * 1.94384  # Convert m/s to knots
+                        future_speeds.append(float(speed_knots))
+
+                    if past_coords or future_coords:
+                        vessel_color = vessel_colors[agent_idx % len(vessel_colors)]
+                        all_vessel_past_coords.append(past_coords)
+                        all_vessel_future_coords.append(future_coords)
+                        all_vessel_ids.append(agent_idx)
+
+                        # Store speed statistics: [avg_past_speed, avg_future_speed]
+                        avg_past_speed = np.mean(past_speeds) if past_speeds else 0.0
+                        avg_future_speed = np.mean(future_speeds) if future_speeds else 0.0
+                        all_vessel_speeds.append({
+                            'past_speeds': past_speeds,
+                            'future_speeds': future_speeds,
+                            'avg_past': float(avg_past_speed),
+                            'avg_future': float(avg_future_speed)
+                        })
+
+                        if agent_idx == predicted_idx:
+                            predicted_vessel_color = vessel_color
+                            logger.info(f"Predicted vessel (agent {agent_idx}): {len(past_coords)} past points, {len(future_coords)} future points")
+                            logger.info(f"   Speed: history avg={avg_past_speed:.2f} kts, GT future avg={avg_future_speed:.2f} kts")
+            else:
+                logger.warning("Could not load original pickle data, using ego-centric coordinates (vessels will appear stacked)")
+                # Fallback to old method (will show stacked vessels)
+                for agent_idx in range(num_agents):
+                    valid_mask = obj_mask[agent_idx] > 0
+                    if not np.any(valid_mask):
+                        continue
+
+                    agent_traj = obj_trajs[agent_idx]
+                    past_coords = []
+                    for t in range(past_len):
+                        if valid_mask[t]:
+                            x, y = agent_traj[t, 0], agent_traj[t, 1]
+                            if not (np.isnan(x) or np.isnan(y)):
+                                x_scenario = float(x + reference_position[0])
+                                y_scenario = float(y + reference_position[1])
+                                lat, lon = self._meters_to_latlon(x_scenario, y_scenario, ref_lat, ref_lon)
+                                past_coords.append([lat, lon])
+
+                    future_coords = []
+                    if future_gt is not None and agent_idx < future_gt.shape[0]:
+                        agent_future_gt = future_gt[agent_idx]
+                        agent_future_mask = future_gt_mask[agent_idx]
+                        for t in range(len(agent_future_gt)):
+                            if agent_future_mask[t]:
+                                x, y = agent_future_gt[t, 0], agent_future_gt[t, 1]
+                                if not (np.isnan(x) or np.isnan(y)):
+                                    x_scenario = float(x + reference_position[0])
+                                    y_scenario = float(y + reference_position[1])
+                                    lat, lon = self._meters_to_latlon(x_scenario, y_scenario, ref_lat, ref_lon)
+                                    future_coords.append([lat, lon])
+
+                    if past_coords or future_coords:
+                        vessel_color = vessel_colors[agent_idx % len(vessel_colors)]
+                        all_vessel_past_coords.append(past_coords)
+                        all_vessel_future_coords.append(future_coords)
+                        all_vessel_ids.append(agent_idx)
+                        if agent_idx == predicted_idx:
+                            predicted_vessel_color = vessel_color
+
+            # Convert prediction to lat/lon
+            # CRITICAL: Predictions are ego-relative (relative to last observed position at t=20)
+            # We need to add the ego vessel's ABSOLUTE last observed position from pickle data
+            pred_coords = []
+            pred_speeds = []  # Speeds for predicted trajectory
+
+            if pickle_data is not None:
+                # Get ego vessel's absolute last observed position from pickle
+                tracks = pickle_data['tracks']
+                track_ids = list(tracks.keys())
+                if predicted_idx < len(track_ids):
+                    ego_track_id = track_ids[predicted_idx]
+                    ego_positions = tracks[ego_track_id]['state']['position']
+
+                    # Last observed position is at: window_start_idx + past_len - 1
+                    last_observed_idx = window_start_idx + past_len - 1
+                    if last_observed_idx < len(ego_positions):
+                        ego_last_abs_x, ego_last_abs_y = ego_positions[last_observed_idx]
+                        logger.info(f"Ego vessel last observed position (absolute): ({ego_last_abs_x:.2f}, {ego_last_abs_y:.2f})")
+
+                        # Store absolute predicted positions for speed calculation
+                        pred_positions_abs = []
+                        # Get position_scale from config (predictions are normalized)
+                        position_scale = getattr(self.config, 'position_scale', 100.0)
+
+                        # Transform predictions: absolute = (ego_relative_normalized * scale) + ego_last_absolute
+                        for x, y in predictions[0]:
+                            if not (np.isnan(x) or np.isnan(y)):
+                                # Denormalize first: multiply by position_scale to convert to meters
+                                x_meters = float(x) * position_scale
+                                y_meters = float(y) * position_scale
+                                # Then add absolute offset to get absolute coordinates
+                                abs_x = x_meters + float(ego_last_abs_x)
+                                abs_y = y_meters + float(ego_last_abs_y)
+                                pred_positions_abs.append([abs_x, abs_y])
+                                lat, lon = self._meters_to_latlon(abs_x, abs_y, ref_lat, ref_lon)
+                                pred_coords.append([lat, lon])
+
+                        # Calculate prediction speeds from position deltas (1 second intervals)
+                        for i in range(len(pred_positions_abs)):
+                            if i == 0:
+                                # Speed from last observed to first predicted
+                                dx = pred_positions_abs[0][0] - ego_last_abs_x
+                                dy = pred_positions_abs[0][1] - ego_last_abs_y
+                            else:
+                                # Speed between consecutive predictions
+                                dx = pred_positions_abs[i][0] - pred_positions_abs[i-1][0]
+                                dy = pred_positions_abs[i][1] - pred_positions_abs[i-1][1]
+
+                            speed_ms = np.sqrt(dx**2 + dy**2)  # m/s (1 second timesteps)
+                            speed_knots = speed_ms * 1.94384
+                            pred_speeds.append(float(speed_knots))
+
+                        # Log prediction speed stats
+                        if pred_speeds:
+                            avg_pred_speed = np.mean(pred_speeds)
+                            logger.info(f"   Prediction speed: avg={avg_pred_speed:.2f} kts, speeds={[f'{s:.2f}' for s in pred_speeds]}")
+
+                            # Update the speed data for the predicted vessel to include predictions
+                            if predicted_idx < len(all_vessel_speeds):
+                                all_vessel_speeds[predicted_idx]['pred_speeds'] = pred_speeds
+                                all_vessel_speeds[predicted_idx]['avg_pred'] = float(avg_pred_speed)
+                    else:
+                        logger.warning(f"Last observed index {last_observed_idx} out of range for ego vessel")
+                        # Fallback to old method
+                        for x, y in predictions[0]:
+                            if not (np.isnan(x) or np.isnan(y)):
+                                lat, lon = self._meters_to_latlon(float(x), float(y), ref_lat, ref_lon)
+                                pred_coords.append([lat, lon])
+                else:
+                    logger.warning(f"Predicted index {predicted_idx} out of range")
+                    # Fallback to old method
+                    for x, y in predictions[0]:
+                        if not (np.isnan(x) or np.isnan(y)):
+                            lat, lon = self._meters_to_latlon(float(x), float(y), ref_lat, ref_lon)
+                            pred_coords.append([lat, lon])
+            else:
+                logger.warning("No pickle data, using ref_lat/ref_lon directly (predictions will be wrong)")
+                # Fallback to old method (will be wrong for ego-relative predictions)
+                for x, y in predictions[0]:
+                    if not (np.isnan(x) or np.isnan(y)):
+                        lat, lon = self._meters_to_latlon(float(x), float(y), ref_lat, ref_lon)
+                        pred_coords.append([lat, lon])
+
+            # Convert GT future to lat/lon
+            gt_future_coords = []
+            gt_positions_abs = []  # Store absolute GT positions
+
+            logger.info(f"[DEBUG_GT_VIZ] Converting GT to lat/lon:")
+            logger.info(f"[DEBUG_GT_VIZ]   GT input (first 3, NORMALIZED): {[(float(x), float(y)) for x, y in ground_truth[0][:3]]}")
+
+            if pickle_data is not None:
+                # GT also needs denormalization and absolute offset (same as predictions!)
+                position_scale = getattr(self.config, 'position_scale', 100.0)
+                logger.info(f"[DEBUG_GT_VIZ]   position_scale={position_scale}")
+                logger.info(f"[DEBUG_GT_VIZ]   ego_last_abs position: ({ego_last_abs_x:.2f}, {ego_last_abs_y:.2f})")
+
+                for i, (x, y) in enumerate(ground_truth[0]):
+                    if not (np.isnan(x) or np.isnan(y)):
+                        # Denormalize first: multiply by position_scale
+                        x_meters = float(x) * position_scale
+                        y_meters = float(y) * position_scale
+                        # Then add absolute offset
+                        abs_x = x_meters + float(ego_last_abs_x)
+                        abs_y = y_meters + float(ego_last_abs_y)
+                        gt_positions_abs.append([abs_x, abs_y])
+                        lat, lon = self._meters_to_latlon(abs_x, abs_y, ref_lat, ref_lon)
+                        gt_future_coords.append([lat, lon])
+
+                        if i < 3:
+                            logger.info(f"[DEBUG_GT_VIZ]   t={i}: normalized=({x:.6f},{y:.6f}) -> meters=({x_meters:.2f},{y_meters:.2f}) -> abs=({abs_x:.2f},{abs_y:.2f}) -> latlon=({lat:.6f},{lon:.6f})")
+            else:
+                # Fallback (should not happen)
+                logger.warning("[DEBUG_GT_VIZ] No pickle_data, using ref_lat/ref_lon directly")
+                for x, y in ground_truth[0]:
+                    if not (np.isnan(x) or np.isnan(y)):
+                        lat, lon = self._meters_to_latlon(float(x), float(y), ref_lat, ref_lon)
+                        gt_future_coords.append([lat, lon])
+
+            # Calculate center from all vessels (past + future)
+            all_lats = []
+            all_lons = []
+            for coords_list in all_vessel_past_coords:
+                all_lats.extend([c[0] for c in coords_list])
+                all_lons.extend([c[1] for c in coords_list])
+            for coords_list in all_vessel_future_coords:
+                all_lats.extend([c[0] for c in coords_list])
+                all_lons.extend([c[1] for c in coords_list])
+
+            if all_lats and all_lons:
+                center_lat = np.mean(all_lats)
+                center_lon = np.mean(all_lons)
+            else:
+                center_lat, center_lon = ref_lat, ref_lon
+
+        else:
+            # Single-agent mode (backward compatibility)
+            pred_coords = []
+            for x, y in predictions[0]:
+                if not (np.isnan(x) or np.isnan(y)):
+                    lat, lon = self._meters_to_latlon(float(x), float(y), ref_lat, ref_lon)
+                    pred_coords.append([lat, lon])
+
+            gt_coords = []
+            for x, y in ground_truth[0]:
+                if not (np.isnan(x) or np.isnan(y)):
+                    lat, lon = self._meters_to_latlon(float(x), float(y), ref_lat, ref_lon)
+                    gt_coords.append([lat, lon])
+
+            # Calculate center point from converted coordinates
+            center_lat, center_lon = ref_lat, ref_lon  # Default to reference point
+
+            # Try to get center from ground truth first
+            if gt_coords:
+                center_lat = np.mean([coord[0] for coord in gt_coords])
+                center_lon = np.mean([coord[1] for coord in gt_coords])
+            # If no valid ground truth, try predictions
+            elif pred_coords:
+                center_lat = np.mean([coord[0] for coord in pred_coords])
+                center_lon = np.mean([coord[1] for coord in pred_coords])
+
+            # Wrap in structure for template
+            all_vessel_coords = [gt_coords] if gt_coords else []
+            all_vessel_ids = [0]
+            predicted_vessel_color = vessel_colors[0]
+
+        # Format metrics for display
+        metrics_html = ""
+        if metrics:
+            metrics_html = "<div class='metrics'><h4>Evaluation Metrics</h4>"
+            for key, value in metrics.items():
+                if isinstance(value, (int, float)):
+                    metrics_html += f"<p><strong>{key}:</strong> {value:.4f}</p>"
+                else:
+                    metrics_html += f"<p><strong>{key}:</strong> {value}</p>"
+            metrics_html += "</div>"
+
+        # Define variables for HTML template (ensure they're available in both single/multi-agent modes)
+        if scene_context is not None:
+            # past_len already defined in multi-agent block
+            future_len = future_gt.shape[1] if future_gt is not None else 60
+        else:
+            # Single-agent mode: infer from ground truth shape
+            past_len = 21  # Default
+            future_len = ground_truth.shape[1] if len(ground_truth.shape) > 1 else 60
+            total_timesteps = 0
+            all_vessel_timeline_data = []
+            window_start_idx = 0
+
+        html_template = f'''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>AIS Scenario: {scenario_id}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <!-- Leaflet CSS and JS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+          integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+
+    <style>
+        body {{ margin: 0; padding: 0; font-family: Arial, sans-serif; }}
+        #map {{ height: {'calc(100vh - 140px)' if total_timesteps > 0 else '100vh'}; width: 100%; }}
+        .info-panel {{
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+            z-index: 1000;
+            max-width: 320px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }}
+        .info-panel h3 {{ margin-top: 0; color: #2c5aa0; }}
+        .legend-item {{
+            display: flex;
+            align-items: center;
+            margin: 8px 0;
+        }}
+        .legend-color {{
+            width: 20px;
+            height: 4px;
+            margin-right: 10px;
+            border-radius: 2px;
+        }}
+        .ground-truth {{ background-color: #228B22; }}
+        .prediction {{ background-color: #FF4500; }}
+        .vessel-point {{ background-color: #1E90FF; }}
+        .status {{
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.8);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            z-index: 1000;
+        }}
+        .error {{
+            background: #ffebee;
+            border: 1px solid #f44336;
+            color: #d32f2f;
+            padding: 20px;
+            margin: 20px;
+            border-radius: 5px;
+        }}
+        .metrics {{
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid #ddd;
+        }}
+        .metrics h4 {{ margin-top: 0; color: #2c5aa0; }}
+        .metrics p {{ margin: 5px 0; font-size: 14px; }}
+        .vessel-controls {{
+            margin-top: 10px;
+            padding: 8px;
+            background: #f5f5f5;
+            border-radius: 5px;
+            font-size: 12px;
+        }}
+        .vessel-controls-header {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 5px;
+        }}
+        .toggle-btn {{
+            padding: 3px 8px;
+            margin: 2px;
+            border: 1px solid #ccc;
+            background: white;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 11px;
+            transition: all 0.2s;
+        }}
+        .toggle-btn.active {{
+            background: #4CAF50;
+            color: white;
+            border-color: #4CAF50;
+        }}
+        .toggle-btn:hover {{
+            background: #e0e0e0;
+        }}
+        .toggle-btn.active:hover {{
+            background: #45a049;
+        }}
+        .timeline-controls .toggle-btn {{
+            padding: 8px 16px;
+            font-size: 13px;
+            font-weight: bold;
+        }}
+        .timeline-controls {{
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: rgba(255, 255, 255, 0.98);
+            padding: 15px 20px;
+            box-shadow: 0 -2px 10px rgba(0,0,0,0.2);
+            z-index: 1001;
+        }}
+        .control-row {{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            margin-bottom: 8px;
+        }}
+        .nav-btn {{
+            padding: 8px 16px;
+            background: #2c5aa0;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: bold;
+            transition: background 0.3s;
+        }}
+        .nav-btn:hover {{
+            background: #1e4070;
+        }}
+        .nav-btn:disabled {{
+            background: #ccc;
+            cursor: not-allowed;
+        }}
+        .time-display {{
+            font-size: 16px;
+            font-weight: bold;
+            color: #2c5aa0;
+            min-width: 220px;
+            text-align: center;
+            background: #f0f0f0;
+            padding: 8px 12px;
+            border-radius: 5px;
+        }}
+        .time-slider {{
+            flex: 1;
+            max-width: 600px;
+            height: 6px;
+            border-radius: 3px;
+            background: #ddd;
+            outline: none;
+            cursor: pointer;
+        }}
+        .time-slider::-webkit-slider-thumb {{
+            appearance: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #2c5aa0;
+            cursor: pointer;
+        }}
+        .time-slider::-moz-range-thumb {{
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #2c5aa0;
+            cursor: pointer;
+            border: none;
+        }}
+        .step-selector {{
+            padding: 6px 10px;
+            border-radius: 5px;
+            border: 2px solid #2c5aa0;
+            font-size: 13px;
+            cursor: pointer;
+            background: white;
+        }}
+        .step-label {{
+            font-size: 13px;
+            font-weight: bold;
+            color: #555;
+        }}
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+
+    <div class="info-panel">
+        <h3>AIS Scenario</h3>
+        <p><strong>Scenario:</strong> {scenario_id}</p>
+        <p><strong>Model:</strong> Wayformer-AIS</p>
+        <p><strong>Vessels:</strong> <span id="vessel-count">{len(all_vessel_ids)}</span></p>
+        <div class="legend" id="legend-container">
+            <h4>Vessels & Trajectories:</h4>
+            <!-- Vessel legend will be dynamically generated -->
+        </div>
+        {metrics_html}
+        <p><small>Click trajectories for details</small></p>
+        <p><small>Zoom and pan to explore</small></p>
+        <p><small>Predicted vessel shown with thicker line</small></p>
+    </div>
+
+    <div class="status" id="status">
+        Loading scenario map...
+    </div>
+
+    <div class="timeline-controls" id="timeline-controls" style="display: {'block' if total_timesteps > 0 else 'none'};">
+        <div class="control-row">
+            <button class="nav-btn" id="btn-first" onclick="goToFirst()">First</button>
+            <button class="nav-btn" id="btn-prev" onclick="previousFrame()">Prev</button>
+            <div class="time-display" id="time-display">T = {window_start_idx}s</div>
+            <button class="nav-btn" id="btn-next" onclick="nextFrame()">Next</button>
+            <button class="nav-btn" id="btn-last" onclick="goToLast()">Last</button>
+            <button class="nav-btn" id="btn-play" onclick="togglePlay()">Play</button>
+        </div>
+        <div class="control-row">
+            <span class="step-label">Step:</span>
+            <select class="step-selector" id="step-selector" onchange="updateStepSize()">
+                <option value="1">1s</option>
+                <option value="5">5s</option>
+                <option value="10" selected>10s</option>
+                <option value="30">30s</option>
+                <option value="60">1min</option>
+                <option value="300">5min</option>
+                <option value="600">10min</option>
+            </select>
+            <input type="range" class="time-slider" id="time-slider"
+                   min="0" max="{max(0, total_timesteps - past_len - future_len) if total_timesteps > 0 else 100}"
+                   value="{window_start_idx}" oninput="onSliderChange(this.value)">
+            <span class="step-label" id="time-range-label">0 - {total_timesteps if total_timesteps > 0 else 0}s</span>
+        </div>
+        <div class="control-row">
+            <span class="step-label">Show/Hide:</span>
+            <button class="toggle-btn active" id="btn-toggle-history" onclick="toggleAllHistory()">History</button>
+            <button class="toggle-btn active" id="btn-toggle-gt" onclick="toggleAllGT()">Future GT</button>
+            <button class="toggle-btn active" id="btn-toggle-pred" onclick="toggleAllPredictions()">Predictions</button>
+        </div>
+    </div>
+
+    <script>
+        console.log('Loading AIS Scenario: {scenario_id}');
+
+        // STATIC DATA (for single window visualization - backward compatibility)
+        const predictionCoords = {json.dumps(pred_coords)};
+        const allVesselsPast = {json.dumps(all_vessel_past_coords if scene_context else [])};
+        const allVesselsFutureGT = {json.dumps(all_vessel_future_coords if scene_context else [])};
+        const allVesselSpeeds = {json.dumps(all_vessel_speeds if scene_context else [])};
+
+        // TIMELINE DATA (full 4-hour scene for interactive navigation)
+        const timelineData = {json.dumps(all_vessel_timeline_data) if scene_context and total_timesteps > 0 else '[]'};
+        const totalTimesteps = {total_timesteps if total_timesteps > 0 else 0};
+        const pastLen = {past_len};
+        const futureLen = {future_len};
+        const initialWindowStart = {window_start_idx};
+
+        // Vessel metadata
+        const vesselIds = {json.dumps(all_vessel_ids)};
+        const vesselColors = {json.dumps(vessel_colors[:len(all_vessel_ids)])};
+        const predictedVesselColor = '{predicted_vessel_color}';
+        const predictedVesselIdx = {predicted_idx if scene_context else 0};
+
+        // Timeline state
+        let currentTime = initialWindowStart;
+        let stepSize = 10;
+        let isPlaying = false;
+        let playInterval = null;
+        const maxCurrentTime = Math.max(0, totalTimesteps - pastLen - futureLen);
+
+        // Toggle states - track which trajectory types are visible
+        let showHistory = true;
+        let showFutureGT = true;
+        let showPredictions = true;
+
+        // Zoom preservation: only auto-fit bounds on the first render
+        let initialFitDone = false;
+
+        // Leaflet map and layers
+        let map = null;
+        let vesselLayers = {{}};  // vessel_id -> {{past: [layers], future: [layers], prediction: [layers]}}
+
+        // Check if we have timeline data
+        const hasTimelineData = timelineData.length > 0 && totalTimesteps > 0;
+
+        console.log('Data loaded:');
+        console.log('  Vessels:', vesselIds.length);
+        console.log('  Has timeline data:', hasTimelineData);
+        console.log('  Total timesteps:', totalTimesteps);
+        console.log('  Past length:', pastLen);
+        console.log('  Future length:', futureLen);
+        console.log('  Max current time:', maxCurrentTime);
+
+        // Check if Leaflet loaded
+        if (typeof L === 'undefined') {{
+            document.getElementById('map').innerHTML =
+                '<div class="error">Error: Could not load Leaflet mapping library.</div>';
+        }} else {{
+            console.log('Leaflet loaded successfully');
+
+            try {{
+                // Initialize map - will auto-zoom to fit bounds tightly
+                map = L.map('map').setView([{center_lat}, {center_lon}], 18);
+
+                // Add OpenStreetMap tiles with MUCH higher zoom for detailed trajectory analysis
+                L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+                    attribution: '© OpenStreetMap contributors',
+                    maxZoom: 25,  // Allow extreme zoom for meter-level precision
+                    maxNativeZoom: 19  // OSM native max (will upscale beyond this)
+                }}).addTo(map);
+
+                // Initialize vessel layer groups
+                vesselIds.forEach(function(vesselId) {{
+                    vesselLayers[vesselId] = {{
+                        past: [],
+                        future: [],
+                        prediction: []
+                    }};
+                }});
+
+                // Choose rendering mode: interactive timeline or static
+                if (hasTimelineData) {{
+                    console.log('Initializing INTERACTIVE timeline mode');
+                    initInteractiveTimeline();
+                }} else {{
+                    console.log('Initializing STATIC snapshot mode');
+                    renderStaticSnapshot();
+                }}
+
+                console.log('Scenario map initialized');
+
+            }} catch (error) {{
+                console.error('Error initializing map:', error);
+                document.getElementById('map').innerHTML =
+                    '<div class="error">Error initializing map: ' + error.message + '</div>';
+            }}
+        }}
+
+        // ============= INTERACTIVE TIMELINE FUNCTIONS =============
+
+        function initInteractiveTimeline() {{
+            // Initial render
+            updateVisualization();
+            updateButtonStates();
+            document.getElementById('status').innerHTML = 'Interactive timeline loaded';
+            setTimeout(function() {{
+                document.getElementById('status').style.display = 'none';
+            }}, 2000);
+        }}
+
+        function updateVisualization() {{
+            console.log('Rendering frame at t=' + currentTime + 's');
+
+            // Clear existing layers
+            clearLayers();
+
+            // Calculate time windows
+            const pastStart = Math.max(0, currentTime);
+            const pastEnd = Math.min(currentTime + pastLen, totalTimesteps);
+            const futureStart = pastEnd;
+            const futureEnd = Math.min(pastEnd + futureLen, totalTimesteps);
+
+            const allLayers = [];
+
+            // Render each vessel
+            vesselIds.forEach(function(vesselId, idx) {{
+                if (!timelineData[idx]) return;
+
+                const vessel = timelineData[idx];
+                const vesselColor = vesselColors[idx];
+                const isPredicted = (vesselId === predictedVesselIdx);
+
+                // 1. PAST TRAJECTORY (solid line)
+                const pastCoords = vessel.positions.slice(pastStart, pastEnd);
+                if (pastCoords.length > 1) {{
+                    const pastLine = L.polyline(pastCoords, {{
+                        color: vesselColor,
+                        weight: isPredicted ? 8 : 5,
+                        opacity: 1.0,
+                        dashArray: ''
+                    }});
+
+                    pastLine.bindPopup(
+                        '<b>' + (isPredicted ? 'Predicted ' : '') + 'Vessel ' + vesselId + ' - Past</b><br>' +
+                        'Time: t=' + pastStart + 's to t=' + (pastEnd-1) + 's<br>' +
+                        'Duration: ' + (pastEnd - pastStart) + 's'
+                    );
+
+                    // Only add to map if history is enabled
+                    if (showHistory) {{
+                        pastLine.addTo(map);
+                    }}
+
+                    vesselLayers[vesselId].past.push(pastLine);
+                    allLayers.push(pastLine);
+
+                    // Add position markers
+                    pastCoords.forEach(function(coord, i) {{
+                        const t = pastStart + i;
+                        const speed = vessel.speeds[t] || 0;
+                        const marker = L.circleMarker(coord, {{
+                            radius: isPredicted ? 6 : 4,
+                            fillColor: vesselColor,
+                            color: '#fff',
+                            weight: 2,
+                            opacity: 1,
+                            fillOpacity: 0.9
+                        }});
+
+                        marker.bindPopup(
+                            '<b>Vessel ' + vesselId + '</b><br>' +
+                            'Time: t=' + t + 's<br>' +
+                            'Lat: ' + coord[0].toFixed(6) + '<br>' +
+                            'Lon: ' + coord[1].toFixed(6) + '<br>' +
+                            'Speed: ' + speed.toFixed(2) + ' knots'
+                        );
+
+                        // Only add to map if history is enabled
+                        if (showHistory) {{
+                            marker.addTo(map);
+                        }}
+
+                        vesselLayers[vesselId].past.push(marker);
+                    }});
+                }}
+
+                // 2. FUTURE TRAJECTORY (dashed line - ground truth)
+                const futureCoords = vessel.positions.slice(futureStart, futureEnd);
+                if (futureCoords.length > 1) {{
+                    const futureLine = L.polyline(futureCoords, {{
+                        color: vesselColor,
+                        weight: isPredicted ? 8 : 5,
+                        opacity: 0.7,
+                        dashArray: '10, 5'
+                    }});
+
+                    futureLine.bindPopup(
+                        '<b>' + (isPredicted ? 'Predicted ' : '') + 'Vessel ' + vesselId + ' - Future GT</b><br>' +
+                        'Time: t=' + futureStart + 's to t=' + (futureEnd-1) + 's<br>' +
+                        'Duration: ' + (futureEnd - futureStart) + 's'
+                    );
+
+                    // Only add to map if Future GT is enabled
+                    if (showFutureGT) {{
+                        futureLine.addTo(map);
+                    }}
+
+                    vesselLayers[vesselId].future.push(futureLine);
+                    allLayers.push(futureLine);
+
+                    // Add position markers
+                    futureCoords.forEach(function(coord, i) {{
+                        const t = futureStart + i;
+                        const speed = vessel.speeds[t] || 0;
+                        const marker = L.circleMarker(coord, {{
+                            radius: isPredicted ? 5 : 3,
+                            fillColor: vesselColor,
+                            color: '#fff',
+                            weight: 1,
+                            opacity: 1,
+                            fillOpacity: 0.7
+                        }});
+
+                        marker.bindPopup(
+                            '<b>Vessel ' + vesselId + ' (Future GT)</b><br>' +
+                            'Time: t=' + t + 's<br>' +
+                            'Lat: ' + coord[0].toFixed(6) + '<br>' +
+                            'Lon: ' + coord[1].toFixed(6) + '<br>' +
+                            'Speed: ' + speed.toFixed(2) + ' knots'
+                        );
+
+                        // Only add to map if Future GT is enabled
+                        if (showFutureGT) {{
+                            marker.addTo(map);
+                        }}
+
+                        vesselLayers[vesselId].future.push(marker);
+                    }});
+                }}
+
+                // 3. PREDICTION TRAJECTORY (dotted line - only for predicted vessel)
+                if (isPredicted && predictionCoords.length > 0) {{
+                    const predLine = L.polyline(predictionCoords, {{
+                        color: vesselColor,
+                        weight: 8,
+                        opacity: 0.9,
+                        dashArray: '2, 5'
+                    }});
+
+                    predLine.bindPopup(
+                        '<b>Model Prediction</b><br>' +
+                        'From time: t=' + currentTime + 's<br>' +
+                        'Prediction length: ' + predictionCoords.length + ' points'
+                    );
+
+                    // Only add to map if predictions are enabled
+                    if (showPredictions) {{
+                        predLine.addTo(map);
+                    }}
+
+                    vesselLayers[vesselId].prediction.push(predLine);
+                    allLayers.push(predLine);
+
+                    // Add prediction markers
+                    predictionCoords.forEach(function(coord, i) {{
+                        const marker = L.circleMarker(coord, {{
+                            radius: 5,
+                            fillColor: vesselColor,
+                            color: '#000',
+                            weight: 2,
+                            opacity: 1,
+                            fillOpacity: 0.9
+                        }});
+
+                        marker.bindPopup(
+                            '<b>Prediction t+' + (i+1) + '</b><br>' +
+                            'Lat: ' + coord[0].toFixed(6) + '<br>' +
+                            'Lon: ' + coord[1].toFixed(6)
+                        );
+
+                        // Only add to map if predictions are enabled
+                        if (showPredictions) {{
+                            marker.addTo(map);
+                        }}
+
+                        vesselLayers[vesselId].prediction.push(marker);
+                    }});
+                }}
+            }});
+
+            // Fit map bounds only on first render; preserve user zoom after that
+            if (allLayers.length > 0 && !initialFitDone) {{
+                const group = new L.featureGroup(allLayers);
+                map.fitBounds(group.getBounds().pad(0.1));
+                initialFitDone = true;
+            }}
+
+            // Update time display
+            updateTimeDisplay();
+        }}
+
+        function clearLayers() {{
+            vesselIds.forEach(function(vesselId) {{
+                ['past', 'future', 'prediction'].forEach(function(type) {{
+                    if (vesselLayers[vesselId] && vesselLayers[vesselId][type]) {{
+                        vesselLayers[vesselId][type].forEach(function(layer) {{
+                            map.removeLayer(layer);
+                        }});
+                        vesselLayers[vesselId][type] = [];
+                    }}
+                }});
+            }});
+        }}
+
+        function updateTimeDisplay() {{
+            const hours = Math.floor(currentTime / 3600);
+            const minutes = Math.floor((currentTime % 3600) / 60);
+            const seconds = currentTime % 60;
+            const timeStr = String(hours).padStart(2, '0') + ':' +
+                          String(minutes).padStart(2, '0') + ':' +
+                          String(seconds).padStart(2, '0');
+            document.getElementById('time-display').innerHTML =
+                'T = ' + currentTime + 's (' + timeStr + ')';
+        }}
+
+        function updateButtonStates() {{
+            document.getElementById('btn-first').disabled = (currentTime === 0);
+            document.getElementById('btn-prev').disabled = (currentTime === 0);
+            document.getElementById('btn-next').disabled = (currentTime >= maxCurrentTime);
+            document.getElementById('btn-last').disabled = (currentTime >= maxCurrentTime);
+            document.getElementById('time-slider').value = currentTime;
+        }}
+
+        function nextFrame() {{
+            if (currentTime < maxCurrentTime) {{
+                currentTime = Math.min(currentTime + stepSize, maxCurrentTime);
+                updateVisualization();
+                updateButtonStates();
+            }}
+        }}
+
+        function previousFrame() {{
+            if (currentTime > 0) {{
+                currentTime = Math.max(currentTime - stepSize, 0);
+                updateVisualization();
+                updateButtonStates();
+            }}
+        }}
+
+        function goToFirst() {{
+            currentTime = 0;
+            updateVisualization();
+            updateButtonStates();
+        }}
+
+        function goToLast() {{
+            currentTime = maxCurrentTime;
+            updateVisualization();
+            updateButtonStates();
+        }}
+
+        function onSliderChange(value) {{
+            currentTime = parseInt(value);
+            updateVisualization();
+            updateButtonStates();
+        }}
+
+        function updateStepSize() {{
+            stepSize = parseInt(document.getElementById('step-selector').value);
+            console.log('Step size updated to:', stepSize, 'seconds');
+        }}
+
+        function togglePlay() {{
+            isPlaying = !isPlaying;
+            const btn = document.getElementById('btn-play');
+
+            if (isPlaying) {{
+                btn.innerHTML = 'Pause';
+                playInterval = setInterval(function() {{
+                    if (currentTime >= maxCurrentTime) {{
+                        togglePlay();
+                    }} else {{
+                        nextFrame();
+                    }}
+                }}, 500);
+            }} else {{
+                btn.innerHTML = 'Play';
+                if (playInterval) {{
+                    clearInterval(playInterval);
+                    playInterval = null;
+                }}
+            }}
+        }}
+
+        // Global toggle functions for all vessels
+        function toggleAllHistory() {{
+            const btn = document.getElementById('btn-toggle-history');
+            const isActive = btn.classList.contains('active');
+
+            vesselIds.forEach(function(vesselId) {{
+                if (vesselLayers[vesselId] && vesselLayers[vesselId].past) {{
+                    vesselLayers[vesselId].past.forEach(function(layer) {{
+                        if (isActive) {{
+                            map.removeLayer(layer);
+                        }} else {{
+                            map.addLayer(layer);
+                        }}
+                    }});
+                }}
+            }});
+
+            btn.classList.toggle('active');
+            showHistory = !isActive;  // Update state
+            console.log('History toggled:', showHistory ? 'visible' : 'hidden');
+        }}
+
+        function toggleAllGT() {{
+            const btn = document.getElementById('btn-toggle-gt');
+            const isActive = btn.classList.contains('active');
+
+            vesselIds.forEach(function(vesselId) {{
+                if (vesselLayers[vesselId] && vesselLayers[vesselId].future) {{
+                    vesselLayers[vesselId].future.forEach(function(layer) {{
+                        if (isActive) {{
+                            map.removeLayer(layer);
+                        }} else {{
+                            map.addLayer(layer);
+                        }}
+                    }});
+                }}
+            }});
+
+            btn.classList.toggle('active');
+            showFutureGT = !isActive;  // Update state
+            console.log('Future GT toggled:', showFutureGT ? 'visible' : 'hidden');
+        }}
+
+        function toggleAllPredictions() {{
+            const btn = document.getElementById('btn-toggle-pred');
+            const isActive = btn.classList.contains('active');
+
+            vesselIds.forEach(function(vesselId) {{
+                if (vesselLayers[vesselId] && vesselLayers[vesselId].prediction) {{
+                    vesselLayers[vesselId].prediction.forEach(function(layer) {{
+                        if (isActive) {{
+                            map.removeLayer(layer);
+                        }} else {{
+                            map.addLayer(layer);
+                        }}
+                    }});
+                }}
+            }});
+
+            btn.classList.toggle('active');
+            showPredictions = !isActive;  // Update state
+            console.log('Predictions toggled:', showPredictions ? 'visible' : 'hidden');
+        }}
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', function(e) {{
+            if (!hasTimelineData) return;
+            if (e.key === 'ArrowRight') {{
+                e.preventDefault();
+                nextFrame();
+            }} else if (e.key === 'ArrowLeft') {{
+                e.preventDefault();
+                previousFrame();
+            }} else if (e.key === ' ') {{
+                e.preventDefault();
+                togglePlay();
+            }}
+        }});
+
+        // ============= STATIC SNAPSHOT FUNCTIONS =============
+
+        function renderStaticSnapshot() {{
+            const allLayers = [];
+
+            // Use global vesselLayers (already initialized)
+            // vesselLayers[vesselId] = {{ past: [], future: [], prediction: [] }}
+
+                // 1. PAST TRAJECTORIES (HISTORY) - SOLID LINES
+                allVesselsPast.forEach(function(vesselPast, idx) {{
+                    if (vesselPast.length > 0) {{
+                        const vesselId = vesselIds[idx];
+                        const vesselColor = vesselColors[idx];
+                        const isPredicted = (vesselId === predictedVesselIdx);
+
+                        const pastLine = L.polyline(vesselPast, {{
+                            color: vesselColor,
+                            weight: isPredicted ? 8 : 5,
+                            opacity: 1.0,
+                            dashArray: ''  // SOLID for observed history
+                        }}).addTo(map);
+
+                        // Add speed information to history popup
+                        let popupText = isPredicted
+                            ? '<b>Predicted Vessel ' + vesselId + ' - History (Observed)</b><br>Scenario: {scenario_id}<br>Past trajectory from AIS data'
+                            : '<b>Vessel ' + vesselId + ' - History (Observed)</b><br>Scenario: {scenario_id}<br>Context vessel past';
+
+                        // Add speed data if available
+                        if (allVesselSpeeds[idx] && allVesselSpeeds[idx].avg_past) {{
+                            popupText += '<br><strong>Average Speed:</strong> ' + allVesselSpeeds[idx].avg_past.toFixed(2) + ' knots';
+                        }}
+
+                        pastLine.bindPopup(popupText);
+                        allLayers.push(pastLine);
+                        vesselLayers[vesselId].past.push(pastLine);
+
+                        // Add position markers (every point for maximum detail)
+                        vesselPast.forEach(function(coord, i) {{
+                            // Build popup with speed if available
+                            let popupContent = '<b>Vessel ' + vesselId + ' History t=' + (i+1) + '</b><br>Lat: ' + coord[0].toFixed(6) + '<br>Lon: ' + coord[1].toFixed(6);
+                            if (allVesselSpeeds[idx] && allVesselSpeeds[idx].past_speeds && allVesselSpeeds[idx].past_speeds[i] !== undefined) {{
+                                popupContent += '<br><strong>Speed:</strong> ' + allVesselSpeeds[idx].past_speeds[i].toFixed(2) + ' knots';
+                            }}
+
+                            const marker = L.circleMarker(coord, {{
+                                radius: isPredicted ? 6 : 4,
+                                fillColor: vesselColor,
+                                color: '#fff',
+                                weight: 2,
+                                opacity: 1,
+                                fillOpacity: 0.9
+                            }}).addTo(map)
+                            .bindPopup(popupContent);
+                            vesselLayers[vesselId].past.push(marker);
+                        }});
+                    }}
+                }});
+
+                // 2. FUTURE GT TRAJECTORIES - DASHED LINES
+                allVesselsFutureGT.forEach(function(vesselFuture, idx) {{
+                    if (vesselFuture.length > 0) {{
+                        const vesselId = vesselIds[idx];
+                        const vesselColor = vesselColors[idx];
+                        const isPredicted = (vesselId === predictedVesselIdx);
+
+                        const futureLine = L.polyline(vesselFuture, {{
+                            color: vesselColor,
+                            weight: isPredicted ? 8 : 5,
+                            opacity: 0.8,
+                            dashArray: '10, 5'  // DASHED for ground truth future
+                        }}).addTo(map);
+
+                        // Add speed information to GT future popup
+                        let futurePopupText = isPredicted
+                            ? '<b>Predicted Vessel ' + vesselId + ' - Ground Truth Future</b><br>Scenario: {scenario_id}<br>Actual future path from AIS data'
+                            : '<b>Vessel ' + vesselId + ' - Ground Truth Future</b><br>Scenario: {scenario_id}<br>Context vessel future';
+
+                        // Add speed data if available
+                        if (allVesselSpeeds[idx] && allVesselSpeeds[idx].avg_future) {{
+                            futurePopupText += '<br><strong>Average Speed:</strong> ' + allVesselSpeeds[idx].avg_future.toFixed(2) + ' knots';
+                        }}
+
+                        futureLine.bindPopup(futurePopupText);
+                        allLayers.push(futureLine);
+                        vesselLayers[vesselId].future.push(futureLine);
+
+                        // Add position markers for ALL GT future points
+                        vesselFuture.forEach(function(coord, i) {{
+                            // Build popup with speed if available
+                            let futurePopup = '<b>Vessel ' + vesselId + ' GT Future t=' + (i+1) + '</b><br>Lat: ' + coord[0].toFixed(6) + '<br>Lon: ' + coord[1].toFixed(6);
+                            if (allVesselSpeeds[idx] && allVesselSpeeds[idx].future_speeds && allVesselSpeeds[idx].future_speeds[i] !== undefined) {{
+                                futurePopup += '<br><strong>Speed:</strong> ' + allVesselSpeeds[idx].future_speeds[i].toFixed(2) + ' knots';
+                            }}
+
+                            const marker = L.circleMarker(coord, {{
+                                radius: isPredicted ? 5 : 3,
+                                fillColor: vesselColor,
+                                color: '#fff',
+                                weight: 1,
+                                opacity: 1,
+                                fillOpacity: 0.8
+                            }}).addTo(map)
+                            .bindPopup(futurePopup);
+                            vesselLayers[vesselId].future.push(marker);
+                        }});
+                    }}
+                }});
+
+                // 3. PREDICTION TRAJECTORY - DOTTED LINE
+                if (predictionCoords.length > 0) {{
+                    const predLine = L.polyline(predictionCoords, {{
+                        color: predictedVesselColor,
+                        weight: 8,
+                        opacity: 0.9,
+                        dashArray: '2, 5'  // DOTTED for predictions
+                    }}).addTo(map);
+                    // Add speed information to prediction popup
+                    let predPopupText = '<b>Wayformer Prediction</b><br>Scenario: {scenario_id}<br>Predicted trajectory for vessel ' + predictedVesselIdx;
+
+                    // Add speed data if available
+                    if (allVesselSpeeds[predictedVesselIdx] && allVesselSpeeds[predictedVesselIdx].avg_pred) {{
+                        predPopupText += '<br><strong>Average Speed:</strong> ' + allVesselSpeeds[predictedVesselIdx].avg_pred.toFixed(2) + ' knots';
+                    }}
+
+                    predLine.bindPopup(predPopupText);
+                    allLayers.push(predLine);
+                    vesselLayerGroups[predictedVesselIdx].prediction.push(predLine);
+
+                    // Add prediction position markers (every point for prediction visibility)
+                    predictionCoords.forEach(function(coord, i) {{
+                        // Build popup with speed if available
+                        let predMarkerPopup = '<b>Prediction t=' + (i+1) + '</b><br>Lat: ' + coord[0].toFixed(6) + '<br>Lon: ' + coord[1].toFixed(6);
+                        if (allVesselSpeeds[predictedVesselIdx] && allVesselSpeeds[predictedVesselIdx].pred_speeds && allVesselSpeeds[predictedVesselIdx].pred_speeds[i] !== undefined) {{
+                            predMarkerPopup += '<br><strong>Speed:</strong> ' + allVesselSpeeds[predictedVesselIdx].pred_speeds[i].toFixed(2) + ' knots';
+                        }}
+
+                        const marker = L.circleMarker(coord, {{
+                            radius: 5,
+                            fillColor: predictedVesselColor,
+                            color: '#000',
+                            weight: 2,
+                            opacity: 1,
+                            fillOpacity: 0.9
+                        }}).addTo(map)
+                        .bindPopup(predMarkerPopup);
+                        vesselLayerGroups[predictedVesselIdx].prediction.push(marker);
+                    }});
+                }}
+
+                // Fit map to show all trajectories
+                if (allLayers.length > 0) {{
+                    const group = new L.featureGroup(allLayers);
+                    map.fitBounds(group.getBounds().pad(0.1));
+                }}
+
+                // Generate dynamic legend with toggle controls
+                const legendContainer = document.getElementById('legend-container');
+                let legendHTML = '<h4>Vessels & Trajectories:</h4>';
+
+                vesselIds.forEach(function(vesselId, idx) {{
+                    const vesselColor = vesselColors[idx];
+                    const isPredicted = (vesselId === predictedVesselIdx);
+                    const label = isPredicted ? 'Vessel ' + vesselId + ' (Predicted)' : 'Vessel ' + vesselId;
+                    const weight = isPredicted ? 'font-weight: bold;' : '';
+
+                    legendHTML += '<div class="legend-item" style="' + weight + '">' +
+                                  '<div class="legend-color" style="background-color: ' + vesselColor + ';"></div>' +
+                                  '<span>' + label + '</span></div>';
+
+                    // Add toggle controls for this vessel
+                    legendHTML += '<div class="vessel-controls">' +
+                                  '<div class="vessel-controls-header">' +
+                                  '<span style="font-size: 10px;">Show:</span>' +
+                                  '</div>' +
+                                  '<button class="toggle-btn active" id="toggle-history-' + vesselId + '" onclick="toggleVesselHistory(' + vesselId + ')">History</button>' +
+                                  '<button class="toggle-btn active" id="toggle-gt-' + vesselId + '" onclick="toggleVesselGT(' + vesselId + ')">GT</button>';
+
+                    // Only show prediction toggle for the predicted vessel
+                    if (isPredicted) {{
+                        legendHTML += '<button class="toggle-btn active" id="toggle-pred-' + vesselId + '" onclick="toggleVesselPrediction(' + vesselId + ')">Prediction</button>';
+                    }}
+
+                    legendHTML += '</div>';
+                }});
+
+                legendHTML += '<div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #ddd;">' +
+                              '<div class="legend-item"><span style="border-bottom: 3px solid #333;">History (Observed)</span></div>' +
+                              '<div class="legend-item"><span style="border-bottom: 3px dashed #333;">Future GT (Actual)</span></div>' +
+                              '<div class="legend-item"><span style="border-bottom: 3px dotted #333;">Prediction (Model)</span></div>' +
+                              '</div>';
+
+                legendContainer.innerHTML = legendHTML;
+
+                // Toggle functions for History, GT, and Predictions per vessel
+                window.toggleVesselHistory = function(vesselId) {{
+                    const layers = vesselLayers[vesselId].past;
+                    const btn = document.getElementById('toggle-history-' + vesselId);
+                    const isActive = btn.classList.contains('active');
+
+                    layers.forEach(function(layer) {{
+                        if (isActive) {{
+                            map.removeLayer(layer);
+                        }} else {{
+                            map.addLayer(layer);
+                        }}
+                    }});
+
+                    btn.classList.toggle('active');
+                }};
+
+                window.toggleVesselGT = function(vesselId) {{
+                    const layers = vesselLayers[vesselId].future;
+                    const btn = document.getElementById('toggle-gt-' + vesselId);
+                    const isActive = btn.classList.contains('active');
+
+                    layers.forEach(function(layer) {{
+                        if (isActive) {{
+                            map.removeLayer(layer);
+                        }} else {{
+                            map.addLayer(layer);
+                        }}
+                    }});
+
+                    btn.classList.toggle('active');
+                }};
+
+                window.toggleVesselPrediction = function(vesselId) {{
+                    const layers = vesselLayers[vesselId].prediction;
+                    const btn = document.getElementById('toggle-pred-' + vesselId);
+                    const isActive = btn.classList.contains('active');
+
+                    layers.forEach(function(layer) {{
+                        if (isActive) {{
+                            map.removeLayer(layer);
+                        }} else {{
+                            map.addLayer(layer);
+                        }}
+                    }});
+
+                    btn.classList.toggle('active');
+                }};
+
+                // Update status
+                document.getElementById('status').innerHTML = 'Scenario loaded: ' + vesselIds.length + ' vessels';
+                setTimeout(function() {{
+                    document.getElementById('status').style.display = 'none';
+                }}, 3000);
+
+                console.log('Scenario map initialized with ' + vesselIds.length + ' vessels');
+        }}
+
+        window.addEventListener('error', function(e) {{
+            console.error('JavaScript error:', e.error);
+        }});
+
+        window.addEventListener('load', function() {{
+            console.log('Scenario visualization loaded');
+        }});
+    </script>
+</body>
+</html>'''
+
+        # Write HTML file
+        output_path = os.path.join(output_dir, output_filename)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(html_template)
+
+        return output_path
+
+    def create_timeline_visualizations(self, output_dir):
+        """
+        Create timeline visualizations that combine all time window predictions for each base scenario.
+        Groups scenarios by base ID (vessel + date + time) and creates combined views showing
+        the complete trajectory with all predictions from different time windows.
+        """
+        import glob
+        import re
+        from collections import defaultdict
+
+        try:
+            # Find all HTML files in output directory
+            html_files = glob.glob(os.path.join(output_dir, "ais_*.html"))
+
+            # Group files by base scenario (without time offset)
+            scenario_groups = defaultdict(list)
+            for html_file in html_files:
+                filename = os.path.basename(html_file)
+                # Extract base scenario ID (remove _t{number} suffix)
+                match = re.match(r'(ais_.*?)(?:_t\d+)?\.html$', filename)
+                if match:
+                    base_id = match.group(1)
+                    scenario_groups[base_id].append(html_file)
+
+            logger.info(f"Found {len(scenario_groups)} base scenarios for timeline creation")
+
+            timeline_files = []
+            for base_id, scenario_files in scenario_groups.items():
+                if len(scenario_files) <= 1:
+                    # Skip if only one time window (no timeline needed)
+                    continue
+
+                logger.info(f"Creating timeline for {base_id} with {len(scenario_files)} time windows")
+
+                # Read and parse all HTML files for this scenario
+                all_gt_coords = {}  # vessel_idx -> list of coords
+                all_pred_coords = {}  # vessel_idx -> list of coord lists (one per time window)
+                center_lat = None
+                center_lon = None
+                vessel_colors = ['#228B22', '#4169E1', '#DC143C', '#FF8C00', '#9932CC', '#FF1493', '#00CED1', '#32CD32']
+
+                for scenario_file in sorted(scenario_files):
+                    with open(scenario_file, 'r') as f:
+                        html_content = f.read()
+
+                    # Extract center coordinates from first file
+                    if center_lat is None:
+                        center_match = re.search(r'var map = L\.map\(\'map\'\)\.setView\(\[([0-9.\-]+), ([0-9.\-]+)\]', html_content)
+                        if center_match:
+                            center_lat = float(center_match.group(1))
+                            center_lon = float(center_match.group(2))
+
+                    # Extract ground truth coordinates (only from first file, as they're the same)
+                    if not all_gt_coords:
+                        gt_pattern = r'var vessel(\d+)_gt_coords = (\[.*?\]);'
+                        for match in re.finditer(gt_pattern, html_content, re.DOTALL):
+                            vessel_idx = int(match.group(1))
+                            coords_str = match.group(2)
+                            try:
+                                coords = json.loads(coords_str)
+                                all_gt_coords[vessel_idx] = coords
+                            except json.JSONDecodeError:
+                                logger.warning(f"Failed to parse GT coords for vessel {vessel_idx}")
+
+                    # Extract prediction coordinates from all time windows
+                    pred_pattern = r'var vessel(\d+)_pred_coords = (\[.*?\]);'
+                    for match in re.finditer(pred_pattern, html_content, re.DOTALL):
+                        vessel_idx = int(match.group(1))
+                        coords_str = match.group(2)
+                        try:
+                            coords = json.loads(coords_str)
+                            if len(coords) > 0:  # Only add non-empty predictions
+                                if vessel_idx not in all_pred_coords:
+                                    all_pred_coords[vessel_idx] = []
+                                all_pred_coords[vessel_idx].append(coords)
+                        except json.JSONDecodeError:
+                            logger.warning(f"Failed to parse prediction coords for vessel {vessel_idx}")
+
+                if not all_gt_coords:
+                    logger.warning(f"No ground truth data found for {base_id}")
+                    continue
+
+                # Create combined timeline visualization
+                timeline_filename = f"{base_id}_timeline.html"
+                timeline_path = os.path.join(output_dir, timeline_filename)
+
+                html_content = f'''<!DOCTYPE html>
+<html>
+<head>
+    <title>Timeline: {base_id}</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet-polylinedecorator@1.6.0/dist/leaflet.polylineDecorator.css" />
+    <style>
+        body {{ margin: 0; font-family: Arial, sans-serif; }}
+        #map {{ height: 100vh; }}
+        .legend {{
+            background: white;
+            padding: 10px;
+            border-radius: 5px;
+            box-shadow: 0 0 15px rgba(0,0,0,0.2);
+            font-size: 14px;
+        }}
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet-polylinedecorator@1.6.0/dist/leaflet.polylineDecorator.js"></script>
+    <script>
+        var map = L.map('map').setView([{center_lat}, {center_lon}], 10);
+
+        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            attribution: '&copy; OpenStreetMap contributors'
+        }}).addTo(map);
+
+        var allLayers = [];
+        var bounds = L.latLngBounds();
+'''
+
+                # Add ground truth for each vessel
+                for vessel_idx in sorted(all_gt_coords.keys()):
+                    gt_coords = all_gt_coords[vessel_idx]
+                    color = vessel_colors[vessel_idx % len(vessel_colors)]
+                    gt_coords_json = json.dumps(gt_coords)
+
+                    html_content += f'''
+        // Vessel {vessel_idx + 1} - Complete Ground Truth
+        var vessel{vessel_idx}_gt_coords = {gt_coords_json};
+        if (vessel{vessel_idx}_gt_coords.length > 0) {{
+            var vessel{vessel_idx}_gt_line = L.polyline(vessel{vessel_idx}_gt_coords, {{
+                color: '{color}',
+                weight: 4,
+                opacity: 0.9
+            }}).addTo(map);
+            vessel{vessel_idx}_gt_line.bindPopup('<b>Vessel {vessel_idx + 1} - Complete Ground Truth</b><br>Full trajectory from AIS data');
+            allLayers.push(vessel{vessel_idx}_gt_line);
+
+            // Add direction arrows
+            var vessel{vessel_idx}_gt_arrows = L.polylineDecorator(vessel{vessel_idx}_gt_line, {{
+                patterns: [{{
+                    offset: '10%',
+                    repeat: '15%',
+                    symbol: L.Symbol.arrowHead({{
+                        pixelSize: 12,
+                        polygon: false,
+                        pathOptions: {{ stroke: true, weight: 2, color: '{color}', opacity: 0.9 }}
+                    }})
+                }}]
+            }}).addTo(map);
+
+            // Start/End markers
+            L.circleMarker(vessel{vessel_idx}_gt_coords[0], {{
+                radius: 8,
+                fillColor: '{color}',
+                color: '#fff',
+                weight: 2,
+                opacity: 1,
+                fillOpacity: 1
+            }}).addTo(map).bindPopup('<b>Vessel {vessel_idx + 1} Start</b>');
+
+            L.circleMarker(vessel{vessel_idx}_gt_coords[vessel{vessel_idx}_gt_coords.length-1], {{
+                radius: 8,
+                fillColor: '{color}',
+                color: '#000',
+                weight: 2,
+                opacity: 1,
+                fillOpacity: 1
+            }}).addTo(map).bindPopup('<b>Vessel {vessel_idx + 1} End</b>');
+
+            vessel{vessel_idx}_gt_coords.forEach(function(coord) {{ bounds.extend(coord); }});
+        }}
+'''
+
+                # Add all predictions for each vessel (prediction fan)
+                for vessel_idx in sorted(all_pred_coords.keys()):
+                    pred_coord_lists = all_pred_coords[vessel_idx]
+                    color = vessel_colors[vessel_idx % len(vessel_colors)]
+
+                    for pred_idx, pred_coords in enumerate(pred_coord_lists):
+                        pred_coords_json = json.dumps(pred_coords)
+                        opacity = 0.3 + (0.3 * pred_idx / max(len(pred_coord_lists) - 1, 1))  # Fade from 0.3 to 0.6
+
+                        html_content += f'''
+        // Vessel {vessel_idx + 1} - Prediction Window {pred_idx + 1}
+        var vessel{vessel_idx}_pred{pred_idx}_coords = {pred_coords_json};
+        if (vessel{vessel_idx}_pred{pred_idx}_coords.length > 0) {{
+            var vessel{vessel_idx}_pred{pred_idx}_line = L.polyline(vessel{vessel_idx}_pred{pred_idx}_coords, {{
+                color: '{color}',
+                weight: 2,
+                opacity: {opacity:.2f},
+                dashArray: '5, 5'
+            }}).addTo(map);
+            vessel{vessel_idx}_pred{pred_idx}_line.bindPopup('<b>Vessel {vessel_idx + 1} - Prediction {pred_idx + 1}</b><br>Time window prediction');
+            allLayers.push(vessel{vessel_idx}_pred{pred_idx}_line);
+
+            // Add arrows to predictions
+            var vessel{vessel_idx}_pred{pred_idx}_arrows = L.polylineDecorator(vessel{vessel_idx}_pred{pred_idx}_line, {{
+                patterns: [{{
+                    offset: '10%',
+                    repeat: '20%',
+                    symbol: L.Symbol.arrowHead({{
+                        pixelSize: 8,
+                        polygon: false,
+                        pathOptions: {{ stroke: true, weight: 1, color: '{color}', opacity: {opacity:.2f} }}
+                    }})
+                }}]
+            }}).addTo(map);
+
+            vessel{vessel_idx}_pred{pred_idx}_coords.forEach(function(coord) {{ bounds.extend(coord); }});
+        }}
+'''
+
+                html_content += f'''
+        // Fit map to show all trajectories
+        if (bounds.isValid()) {{
+            map.fitBounds(bounds, {{padding: [20, 20]}});
+        }}
+
+        // Add legend
+        var legend = L.control({{position: 'topright'}});
+        legend.onAdd = function (map) {{
+            var div = L.DomUtil.create('div', 'legend');
+            div.innerHTML = '<h4>Timeline: {base_id}</h4>' +
+                           '<p><strong>Vessels:</strong> {len(all_gt_coords)}</p>' +
+                           '<p><strong>Time Windows:</strong> {len(scenario_files)}</p>' +
+                           '<p><span style="color: #228B22;">Ground Truth</span></p>' +
+                           '<p><span style="color: #228B22;">Predictions (fan)</span></p>' +
+                           '<p><small>Each dashed line is a prediction from different time window</small></p>';
+            return div;
+        }};
+        legend.addTo(map);
+
+    </script>
+</body>
+</html>'''
+
+                with open(timeline_path, 'w') as f:
+                    f.write(html_content)
+
+                timeline_files.append(timeline_path)
+                logger.info(f"Created timeline visualization: {timeline_filename}")
+
+            return timeline_files
+
+        except Exception as e:
+            logger.error(f"Failed to create timeline visualizations: {str(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return []
