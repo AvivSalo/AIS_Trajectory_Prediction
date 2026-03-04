@@ -646,6 +646,7 @@ class LeafletVisualizer:
         metrics: Optional[Dict[str, float]] = None,
         scene_context: Optional[Dict] = None,
         prediction_windows=None,
+        viz_stride: int = 1,
     ) -> str:
         """
         Create Leaflet-based HTML visualization for a single scenario
@@ -1011,6 +1012,9 @@ class LeafletVisualizer:
                         if last_obs >= len(_ego_positions):
                             continue
                         ego_abs_x, ego_abs_y = _ego_positions[last_obs]
+                        # Anchor: vessel's absolute position at prediction start
+                        anchor_lat, anchor_lon = self._meters_to_latlon(
+                            float(ego_abs_x), float(ego_abs_y), ref_lat, ref_lon)
                         fan_coords = []
                         for px, py in pred_norm:
                             if not (np.isnan(px) or np.isnan(py)):
@@ -1023,6 +1027,7 @@ class LeafletVisualizer:
                             pred_fan_data.append({
                                 'color': self._get_gradient_color(t_norm),
                                 'coords': fan_coords,
+                                'anchor': [float(anchor_lat), float(anchor_lon)],
                                 'time_offset': int(win_t),
                             })
 
@@ -1080,6 +1085,17 @@ class LeafletVisualizer:
             total_timesteps = 0
             all_vessel_timeline_data = []
             window_start_idx = 0
+
+        # Build step options: all standard steps >= viz_stride
+        _all_steps = [(1, '1s'), (5, '5s'), (10, '10s'), (30, '30s'),
+                      (60, '1min'), (300, '5min'), (600, '10min')]
+        _valid_steps = [(v, lbl) for v, lbl in _all_steps if v >= viz_stride]
+        # default selection: first step >= viz_stride
+        _default_step = _valid_steps[0][0] if _valid_steps else viz_stride
+        _step_options_html = '\n'.join(
+            f'                <option value="{v}"{" selected" if v == _default_step else ""}>{lbl}</option>'
+            for v, lbl in _valid_steps
+        )
 
         html_template = f'''<!DOCTYPE html>
 <html>
@@ -1308,13 +1324,7 @@ class LeafletVisualizer:
         <div class="control-row">
             <span class="step-label">Step:</span>
             <select class="step-selector" id="step-selector" onchange="updateStepSize()">
-                <option value="1">1s</option>
-                <option value="5">5s</option>
-                <option value="10" selected>10s</option>
-                <option value="30">30s</option>
-                <option value="60">1min</option>
-                <option value="300">5min</option>
-                <option value="600">10min</option>
+                {_step_options_html}
             </select>
             <input type="range" class="time-slider" id="time-slider"
                    min="0" max="{max(0, total_timesteps - past_len - future_len) if total_timesteps > 0 else 100}"
@@ -1326,7 +1336,7 @@ class LeafletVisualizer:
             <button class="toggle-btn active" id="btn-toggle-history" onclick="toggleAllHistory()">History</button>
             <button class="toggle-btn active" id="btn-toggle-gt" onclick="toggleAllGT()">Future GT</button>
             <button class="toggle-btn active" id="btn-toggle-pred" onclick="toggleAllPredictions()">Predictions</button>
-            <button class="toggle-btn active" id="btn-toggle-fan" onclick="togglePredFan()" style="display:{{'inline-block' if pred_fan_data else 'none'}}">Pred Fan</button>
+            <!-- Pred Fan button removed: predictions now update live with timeline -->
         </div>
     </div>
 
@@ -1354,7 +1364,7 @@ class LeafletVisualizer:
 
         // Timeline state
         let currentTime = initialWindowStart;
-        let stepSize = 10;
+        let stepSize = {_default_step};
         let isPlaying = false;
         let playInterval = null;
         const maxCurrentTime = Math.max(0, totalTimesteps - pastLen - futureLen);
@@ -1423,9 +1433,6 @@ class LeafletVisualizer:
                     renderStaticSnapshot();
                 }}
 
-                // Render prediction fan (blue→red gradient across time windows)
-                renderPredFan();
-
                 console.log('Scenario map initialized');
 
             }} catch (error) {{
@@ -1436,6 +1443,18 @@ class LeafletVisualizer:
         }}
 
         // ============= INTERACTIVE TIMELINE FUNCTIONS =============
+
+        // Return the predFanData entry whose time_offset is closest to t
+        function getClosestPrediction(t) {{
+            if (!predFanData || predFanData.length === 0) return null;
+            let best = predFanData[0];
+            let bestDist = Math.abs(best.time_offset - t);
+            for (let i = 1; i < predFanData.length; i++) {{
+                const dist = Math.abs(predFanData[i].time_offset - t);
+                if (dist < bestDist) {{ bestDist = dist; best = predFanData[i]; }}
+            }}
+            return best;
+        }}
 
         function initInteractiveTimeline() {{
             // Initial render
@@ -1577,53 +1596,44 @@ class LeafletVisualizer:
                     }});
                 }}
 
-                // 3. PREDICTION TRAJECTORY (dotted line - only for predicted vessel)
-                if (isPredicted && predictionCoords.length > 0) {{
-                    const predLine = L.polyline(predictionCoords, {{
-                        color: vesselColor,
-                        weight: 8,
-                        opacity: 0.9,
-                        dashArray: '2, 5'
-                    }});
-
-                    predLine.bindPopup(
-                        '<b>Model Prediction</b><br>' +
-                        'From time: t=' + currentTime + 's<br>' +
-                        'Prediction length: ' + predictionCoords.length + ' points'
-                    );
-
-                    // Only add to map if predictions are enabled
-                    if (showPredictions) {{
-                        predLine.addTo(map);
-                    }}
-
-                    vesselLayers[vesselId].prediction.push(predLine);
-                    allLayers.push(predLine);
-
-                    // Add prediction markers
-                    predictionCoords.forEach(function(coord, i) {{
-                        const marker = L.circleMarker(coord, {{
-                            radius: 5,
-                            fillColor: vesselColor,
-                            color: '#000',
-                            weight: 2,
-                            opacity: 1,
-                            fillOpacity: 0.9
+                // 3. PREDICTION TRAJECTORY — live: closest prediction window to currentTime
+                if (isPredicted) {{
+                    const predEntry = getClosestPrediction(currentTime);
+                    const livePredCoords = predEntry ? predEntry.coords : [];
+                    if (livePredCoords.length > 1) {{
+                        const predLine = L.polyline(livePredCoords, {{
+                            color: vesselColor,
+                            weight: 8,
+                            opacity: 0.9,
+                            dashArray: '2, 5'
                         }});
-
-                        marker.bindPopup(
-                            '<b>Prediction t+' + (i+1) + '</b><br>' +
-                            'Lat: ' + coord[0].toFixed(6) + '<br>' +
-                            'Lon: ' + coord[1].toFixed(6)
+                        predLine.bindPopup(
+                            '<b>Model Prediction</b><br>' +
+                            'Window start: t=' + (predEntry ? predEntry.time_offset : currentTime) + 's<br>' +
+                            'Points: ' + livePredCoords.length
                         );
+                        if (showPredictions) predLine.addTo(map);
+                        vesselLayers[vesselId].prediction.push(predLine);
+                        allLayers.push(predLine);
 
-                        // Only add to map if predictions are enabled
-                        if (showPredictions) {{
-                            marker.addTo(map);
-                        }}
-
-                        vesselLayers[vesselId].prediction.push(marker);
-                    }});
+                        livePredCoords.forEach(function(coord, i) {{
+                            const marker = L.circleMarker(coord, {{
+                                radius: 5,
+                                fillColor: vesselColor,
+                                color: '#000',
+                                weight: 2,
+                                opacity: 1,
+                                fillOpacity: 0.9
+                            }});
+                            marker.bindPopup(
+                                '<b>Prediction +' + (i+1) + 's</b><br>' +
+                                'Lat: ' + coord[0].toFixed(6) + '<br>' +
+                                'Lon: ' + coord[1].toFixed(6)
+                            );
+                            if (showPredictions) marker.addTo(map);
+                            vesselLayers[vesselId].prediction.push(marker);
+                        }});
+                    }}
                 }}
             }});
 
@@ -2075,16 +2085,49 @@ class LeafletVisualizer:
             if (!showPredFan || predFanData.length === 0) return;
 
             predFanData.forEach(function(win) {{
-                if (!win.coords || win.coords.length < 2) return;
-                const line = L.polyline(win.coords, {{
-                    color: win.color,
-                    weight: 1.5,
-                    opacity: 0.35,
-                    dashArray: '5, 5'
+                if (!win.coords || win.coords.length === 0) return;
+                const label = 'Prediction at t=' + win.time_offset + 's';
+
+                // Draw thin connecting line between dots
+                if (win.coords.length >= 2) {{
+                    const line = L.polyline(win.coords, {{
+                        color: win.color,
+                        weight: 1.0,
+                        opacity: 0.4,
+                    }});
+                    line.addTo(map);
+                    predFanLayers.push(line);
+                }}
+
+                // Anchor dot: vessel position at start of this prediction window
+                if (win.anchor) {{
+                    const anchor = L.circleMarker(win.anchor, {{
+                        radius: 4,
+                        color: win.color,
+                        fillColor: win.color,
+                        fillOpacity: 0.9,
+                        weight: 1,
+                    }});
+                    anchor.bindTooltip(label + ' (start)', {{sticky: true}});
+                    anchor.addTo(map);
+                    predFanLayers.push(anchor);
+                }}
+
+                // Prediction dots: one per future timestep
+                win.coords.forEach(function(coord, idx) {{
+                    // Show every 5th dot to avoid clutter (60 steps → 12 dots)
+                    if (idx % 5 !== 4) return;
+                    const dot = L.circleMarker(coord, {{
+                        radius: 3,
+                        color: win.color,
+                        fillColor: win.color,
+                        fillOpacity: 0.75,
+                        weight: 0,
+                    }});
+                    dot.bindTooltip(label + ' +' + (idx + 1) + 's', {{sticky: true}});
+                    dot.addTo(map);
+                    predFanLayers.push(dot);
                 }});
-                line.bindTooltip('Prediction at t=' + win.time_offset + 's', {{sticky: true}});
-                line.addTo(map);
-                predFanLayers.push(line);
             }});
         }}
 

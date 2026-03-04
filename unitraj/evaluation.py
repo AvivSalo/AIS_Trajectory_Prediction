@@ -6,6 +6,7 @@ from typing import Dict, List, Any, Optional
 import logging
 
 torch.set_float32_matmul_precision('medium')
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
 from models import build_model
@@ -167,7 +168,7 @@ class EvaluationCallback(pl.Callback):
                 print(f"   t={s['label']:<12}  {s['count']:>8,}  {s['ade']:>8.2f}  {s['fde']:>8.2f}  {s['miss']:>7.1f}%")
 
             # --- Visualizations ---
-            VIZ_STRIDE = 30
+            VIZ_STRIDE = 5
             leaflet_viz = LeafletVisualizer(config=self.config)
 
             metrics = {}
@@ -205,6 +206,7 @@ class EvaluationCallback(pl.Callback):
                     metrics=metrics,
                     scene_context=scene_ctx,
                     prediction_windows=display_windows,
+                    viz_stride=VIZ_STRIDE,
                 )
                 created_files.append(output_path)
                 logger.info(f"✅ Created viz for vessel {vessel_id}")
