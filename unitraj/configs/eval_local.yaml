@@ -7,7 +7,7 @@ devices: [ 0 ]
 normalize_data: True
 
 # data related - use local single scene for testing
-load_num_workers: 4
+load_num_workers: 8
 train_data_path: [ "/home/aviv/Projects/UniTraj/data/ais_single_scene" ]
 val_data_path: [ "/home/aviv/Projects/UniTraj/data/val_9_scenes_from_ec2" ]
 cache_path: "./cache"
@@ -15,7 +15,7 @@ max_data_num: [ null ]
 starting_frame: [ 0 ]
 past_len: 300  # Must match training config
 future_len: 60  # Must match training config
-stride: 150
+stride: 1
 object_type: [ 'VESSEL' ]
 line_type: [ ]
 masked_attributes: [ 'z_axis', 'size' ]

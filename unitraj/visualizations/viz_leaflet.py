@@ -615,6 +615,27 @@ class LeafletVisualizer:
         logger.warning(f"Could not find original pickle file for scenario: {scenario_id}")
         return None
 
+    def _get_gradient_color(self, t: float) -> str:
+        """Return a hex color on a blue→green→red gradient.
+
+        Args:
+            t: Normalized position 0.0 (blue/early) → 1.0 (red/late)
+        """
+        t = max(0.0, min(1.0, t))
+        if t < 0.5:
+            # blue → green
+            u = t / 0.5
+            r = 0
+            g = int(255 * u)
+            b = int(255 * (1 - u))
+        else:
+            # green → red
+            u = (t - 0.5) / 0.5
+            r = int(255 * u)
+            g = int(255 * (1 - u))
+            b = 0
+        return f'#{r:02x}{g:02x}{b:02x}'
+
     def create_visualization(
         self,
         predictions: np.ndarray,
@@ -623,7 +644,8 @@ class LeafletVisualizer:
         output_dir: str,
         output_filename: str,
         metrics: Optional[Dict[str, float]] = None,
-        scene_context: Optional[Dict] = None
+        scene_context: Optional[Dict] = None,
+        prediction_windows=None,
     ) -> str:
         """
         Create Leaflet-based HTML visualization for a single scenario
@@ -975,8 +997,38 @@ class LeafletVisualizer:
             else:
                 center_lat, center_lon = ref_lat, ref_lon
 
+            # --- Prediction fan data (multi-window, blue→red gradient) ---
+            pred_fan_data = []
+            if prediction_windows is not None and pickle_data is not None:
+                _tracks = pickle_data['tracks']
+                _track_ids = list(_tracks.keys())
+                if predicted_idx < len(_track_ids):
+                    _ego_positions = _tracks[_track_ids[predicted_idx]]['state']['position']
+                    _pos_scale = getattr(self.config, 'position_scale', 100.0) if self.config else 100.0
+                    n_wins = len(prediction_windows)
+                    for win_i, (win_t, pred_norm) in enumerate(prediction_windows):
+                        last_obs = win_t + past_len - 1
+                        if last_obs >= len(_ego_positions):
+                            continue
+                        ego_abs_x, ego_abs_y = _ego_positions[last_obs]
+                        fan_coords = []
+                        for px, py in pred_norm:
+                            if not (np.isnan(px) or np.isnan(py)):
+                                abs_x = float(px) * _pos_scale + float(ego_abs_x)
+                                abs_y = float(py) * _pos_scale + float(ego_abs_y)
+                                fan_lat, fan_lon = self._meters_to_latlon(abs_x, abs_y, ref_lat, ref_lon)
+                                fan_coords.append([float(fan_lat), float(fan_lon)])
+                        if fan_coords:
+                            t_norm = win_i / max(n_wins - 1, 1)
+                            pred_fan_data.append({
+                                'color': self._get_gradient_color(t_norm),
+                                'coords': fan_coords,
+                                'time_offset': int(win_t),
+                            })
+
         else:
             # Single-agent mode (backward compatibility)
+            pred_fan_data = []  # no fan in single-agent mode
             pred_coords = []
             for x, y in predictions[0]:
                 if not (np.isnan(x) or np.isnan(y)):
@@ -1274,6 +1326,7 @@ class LeafletVisualizer:
             <button class="toggle-btn active" id="btn-toggle-history" onclick="toggleAllHistory()">History</button>
             <button class="toggle-btn active" id="btn-toggle-gt" onclick="toggleAllGT()">Future GT</button>
             <button class="toggle-btn active" id="btn-toggle-pred" onclick="toggleAllPredictions()">Predictions</button>
+            <button class="toggle-btn active" id="btn-toggle-fan" onclick="togglePredFan()" style="display:{{'inline-block' if pred_fan_data else 'none'}}">Pred Fan</button>
         </div>
     </div>
 
@@ -1305,6 +1358,11 @@ class LeafletVisualizer:
         let isPlaying = false;
         let playInterval = null;
         const maxCurrentTime = Math.max(0, totalTimesteps - pastLen - futureLen);
+
+        // Prediction fan data (multi-window, blue→red gradient)
+        const predFanData = {json.dumps(pred_fan_data)};
+        let showPredFan = true;
+        let predFanLayers = [];
 
         // Toggle states - track which trajectory types are visible
         let showHistory = true;
@@ -1364,6 +1422,9 @@ class LeafletVisualizer:
                     console.log('Initializing STATIC snapshot mode');
                     renderStaticSnapshot();
                 }}
+
+                // Render prediction fan (blue→red gradient across time windows)
+                renderPredFan();
 
                 console.log('Scenario map initialized');
 
@@ -1937,8 +1998,13 @@ class LeafletVisualizer:
                 legendHTML += '<div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #ddd;">' +
                               '<div class="legend-item"><span style="border-bottom: 3px solid #333;">History (Observed)</span></div>' +
                               '<div class="legend-item"><span style="border-bottom: 3px dashed #333;">Future GT (Actual)</span></div>' +
-                              '<div class="legend-item"><span style="border-bottom: 3px dotted #333;">Prediction (Model)</span></div>' +
-                              '</div>';
+                              '<div class="legend-item"><span style="border-bottom: 3px dotted #333;">Prediction (Model)</span></div>';
+                if (predFanData.length > 0) {{
+                    legendHTML += '<div class="legend-item" style="margin-top:6px;">' +
+                                  '<span style="background: linear-gradient(to right, #0000ff, #00ff00, #ff0000); width:40px; height:4px; display:inline-block; margin-right:8px; border-radius:2px;"></span>' +
+                                  '<span>Pred Fan (early→late)</span></div>';
+                }}
+                legendHTML += '</div>';
 
                 legendContainer.innerHTML = legendHTML;
 
@@ -1998,6 +2064,35 @@ class LeafletVisualizer:
                 }}, 3000);
 
                 console.log('Scenario map initialized with ' + vesselIds.length + ' vessels');
+        }}
+
+        // ============= PREDICTION FAN (multi-window, blue→red) =============
+
+        function renderPredFan() {{
+            // Remove existing fan layers
+            predFanLayers.forEach(function(l) {{ map.removeLayer(l); }});
+            predFanLayers = [];
+            if (!showPredFan || predFanData.length === 0) return;
+
+            predFanData.forEach(function(win) {{
+                if (!win.coords || win.coords.length < 2) return;
+                const line = L.polyline(win.coords, {{
+                    color: win.color,
+                    weight: 1.5,
+                    opacity: 0.35,
+                    dashArray: '5, 5'
+                }});
+                line.bindTooltip('Prediction at t=' + win.time_offset + 's', {{sticky: true}});
+                line.addTo(map);
+                predFanLayers.push(line);
+            }});
+        }}
+
+        function togglePredFan() {{
+            showPredFan = !showPredFan;
+            renderPredFan();
+            const btn = document.getElementById('btn-toggle-fan');
+            if (btn) btn.classList.toggle('active', showPredFan);
         }}
 
         window.addEventListener('error', function(e) {{
