@@ -2,6 +2,8 @@ import pytorch_lightning as pl
 import torch
 import numpy as np
 import os
+import time
+from datetime import datetime
 from typing import Dict, List, Any, Optional
 import logging
 
@@ -15,6 +17,7 @@ from utils.utils import set_seed
 import hydra
 from omegaconf import OmegaConf
 from visualizations.viz_leaflet import LeafletVisualizer
+from benchmark.report import create_report
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +33,17 @@ class EvaluationCallback(pl.Callback):
         self.vessel_first_scene_ctx = {} # {vessel_id: scene_context dict} — first window only
         self.output_dir = "evaluation_visualizations"
         self.config = config
+        self._eval_start_time = None
+        self._batch_count = 0
         os.makedirs(self.output_dir, exist_ok=True)
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        self._eval_start_time = time.time()
+        self._batch_count = 0
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         """Collect lean GPU metrics and per-window predictions."""
+        self._batch_count += 1
         try:
             input_dict = batch['input_dict']
             prediction, loss = pl_module.forward(batch)
@@ -128,39 +138,54 @@ class EvaluationCallback(pl.Callback):
             logger.warning(f"Failed to collect batch data: {str(e)}")
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        """Compute aggregate + per-timestamp metrics, then create visualizations."""
+        """Compute aggregate + per-timestamp metrics, then create visualizations and report."""
         if not self.all_sample_metrics:
             logger.warning("No metrics collected for visualization")
             return
+
+        eval_duration = time.time() - self._eval_start_time if self._eval_start_time else 0
 
         try:
             all_ade  = np.array([s['min_ade_m'] for s in self.all_sample_metrics])
             all_fde  = np.array([s['min_fde_m'] for s in self.all_sample_metrics])
             all_miss = np.array([s['miss'] for s in self.all_sample_metrics], dtype=float)
+            n_samples = len(self.all_sample_metrics)
+            n_vessels = len(self.vessel_pred_windows)
+            n_batches = self._batch_count
 
             # --- Per-timestamp bins ---
             bins       = [0, 60, 120, 180, 240, 300, 400, 500, 600, 9999]
-            bin_labels = ['0– 60s', '60–120s', '120–180s', '180–240s',
+            bin_labels = ['0–60s', '60–120s', '120–180s', '180–240s',
                           '240–300s', '300–400s', '400–500s', '500–600s', '600+s']
             per_bin = []
             for j, (lo, hi) in enumerate(zip(bins, bins[1:])):
                 mask = np.array([lo <= s['time_offset'] < hi for s in self.all_sample_metrics])
                 if mask.sum() > 0:
                     per_bin.append({
-                        'label':  bin_labels[j],
-                        'count':  int(mask.sum()),
-                        'ade':    float(all_ade[mask].mean()),
-                        'fde':    float(all_fde[mask].mean()),
-                        'miss':   float(all_miss[mask].mean()) * 100,
+                        'label':   bin_labels[j],
+                        'count':   int(mask.sum()),
+                        'ade':     float(all_ade[mask].mean()),
+                        'fde':     float(all_fde[mask].mean()),
+                        'miss':    float(all_miss[mask].mean()) * 100,
+                        'miss_4m': float((all_fde[mask] > 4.0).mean()) * 100,
+                        'miss_8m': float((all_fde[mask] > 8.0).mean()) * 100,
                     })
 
+            # --- Per-vessel metrics ---
+            vessel_metrics_map = {}
+            for m in self.all_sample_metrics:
+                vid = m['vessel_id']
+                vessel_metrics_map.setdefault(vid, {'ade': [], 'fde': [], 'miss': []})
+                vessel_metrics_map[vid]['ade'].append(m['min_ade_m'])
+                vessel_metrics_map[vid]['fde'].append(m['min_fde_m'])
+                vessel_metrics_map[vid]['miss'].append(float(m['miss']))
+
             # --- Print summary ---
-            n_vessels = len(self.vessel_pred_windows)
-            n_batches = (len(self.all_sample_metrics) + 31) // 32
             print(f"\n📊 Dense Evaluation — Val Scenes (stride=1)")
-            print(f"   Samples: {len(self.all_sample_metrics):>8,}  |  Vessels: {n_vessels}  |  Batches: {n_batches:,}")
+            print(f"   Samples: {n_samples:>8,}  |  Vessels: {n_vessels}  |  Batches: {n_batches:,}")
+            print(f"   Inference: {eval_duration:.1f}s total  |  {eval_duration/n_samples*1000:.1f}ms/sample  |  {n_samples/eval_duration:.0f} samples/s")
             print(f"\n   ── Overall ──────────────────────────────────────────────────")
-            print(f"   minADE6: {all_ade.mean():.2f} m   |  minFDE6: {all_fde.mean():.2f} m  |  Miss: {all_miss.mean()*100:.1f}%")
+            print(f"   minADE6: {all_ade.mean():.2f} m   |  minFDE6: {all_fde.mean():.2f} m  |  Miss@2m: {all_miss.mean()*100:.1f}%")
             print(f"\n   ── By Time Offset (prediction start) ────────────────────────")
             print(f"   {'Phase':<14}  {'Samples':>8}  {'minADE6':>8}  {'minFDE6':>8}  {'Miss%':>7}")
             print(f"   {'-'*58}")
@@ -168,15 +193,14 @@ class EvaluationCallback(pl.Callback):
                 print(f"   t={s['label']:<12}  {s['count']:>8,}  {s['ade']:>8.2f}  {s['fde']:>8.2f}  {s['miss']:>7.1f}%")
 
             # --- Visualizations ---
-            VIZ_STRIDE = 5
+            # VIZ_STRIDE=1: show every eval window (stride=60 already limits count).
+            # Higher values skip windows → big gaps between prediction updates in viz.
+            VIZ_STRIDE = 1
             leaflet_viz = LeafletVisualizer(config=self.config)
 
-            metrics = {}
-            if hasattr(trainer, 'logged_metrics'):
-                metrics = {k: float(v) for k, v in trainer.logged_metrics.items()
-                           if isinstance(v, (int, float, torch.Tensor))}
-
             created_files = []
+            per_vessel_list = []
+
             for vessel_id, windows in self.vessel_pred_windows.items():
                 sorted_windows = sorted(windows, key=lambda x: x[0])
                 display_windows = sorted_windows[::VIZ_STRIDE]
@@ -188,6 +212,16 @@ class EvaluationCallback(pl.Callback):
                 if first_gt_norm is None:
                     continue
 
+                # Per-vessel metrics for individual viz sidebar
+                vm = vessel_metrics_map.get(vessel_id, {})
+                scene_metrics = {}
+                if vm:
+                    scene_metrics = {
+                        'val/minADE6':   float(np.mean(vm['ade'])),
+                        'val/minFDE6':   float(np.mean(vm['fde'])),
+                        'val/miss_rate': float(np.mean(vm['miss'])),
+                    }
+
                 scenario_id_with_t = f"{vessel_id}_t{first_time_offset}"
                 scene_ctx = self.vessel_first_scene_ctx.get(vessel_id)
 
@@ -197,13 +231,14 @@ class EvaluationCallback(pl.Callback):
                 if len(clean_id) > 50:
                     clean_id = f"{clean_id[:40]}_{hash(vessel_id) % 10000:04d}"
 
+                output_filename = f"ais_vessel_{clean_id}.html"
                 output_path = leaflet_viz.create_visualization(
                     predictions=first_pred_norm.reshape(1, -1, 2),
                     ground_truth=first_gt_norm.reshape(1, -1, 2),
                     scenario_id=scenario_id_with_t,
                     output_dir=self.output_dir,
-                    output_filename=f"ais_vessel_{clean_id}.html",
-                    metrics=metrics,
+                    output_filename=output_filename,
+                    metrics=scene_metrics,
                     scene_context=scene_ctx,
                     prediction_windows=display_windows,
                     viz_stride=VIZ_STRIDE,
@@ -211,10 +246,82 @@ class EvaluationCallback(pl.Callback):
                 created_files.append(output_path)
                 logger.info(f"✅ Created viz for vessel {vessel_id}")
 
+                per_vessel_list.append({
+                    'vessel_id':   vessel_id,
+                    'samples':     len(vm.get('ade', [])),
+                    'ade':         float(np.mean(vm['ade'])) if vm else 0.0,
+                    'fde':         float(np.mean(vm['fde'])) if vm else 0.0,
+                    'miss':        float(np.mean(vm['miss'])) * 100 if vm else 0.0,
+                    'p90_fde':     float(np.percentile(vm['fde'], 90)) if vm else 0.0,
+                    'html_file':   output_filename,
+                })
+
+            # --- FDE CDF (150 sample points) ---
+            sorted_fde = np.sort(all_fde)
+            p99_fde = float(np.percentile(all_fde, 99))
+            cdf_x_arr = np.linspace(0, p99_fde, 150)
+            cdf_x = [round(float(v), 3) for v in cdf_x_arr]
+            cdf_y = [round(float((sorted_fde <= v).mean() * 100), 2) for v in cdf_x_arr]
+
+            # --- ADE histogram ---
+            hist_edges = [0, 0.5, 1, 2, 3, 5, 8, 12, 20, 9999]
+            hist_labels_list = ['0–0.5', '0.5–1', '1–2', '2–3', '3–5', '5–8', '8–12', '12–20', '20+']
+            hist_counts_list = [
+                int(((all_ade >= hist_edges[k]) & (all_ade < hist_edges[k + 1])).sum())
+                for k in range(len(hist_labels_list))
+            ]
+
+            # --- Generate aggregate report ---
+            cfg = self.config
+            report_data = {
+                'timestamp':        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'exp_name':         str(getattr(cfg, 'exp_name', 'unknown')),
+                'ckpt_path':        str(getattr(cfg, 'ckpt_path', 'unknown')),
+                'stride':           int(getattr(cfg, 'stride', 1)),
+                'past_len':         int(getattr(cfg, 'past_len', 300)),
+                'future_len':       int(getattr(cfg, 'future_len', 60)),
+                'eval_batch_size':  int(getattr(cfg, 'eval_batch_size', 96)),
+                'load_num_workers': int(getattr(cfg, 'load_num_workers', 8)),
+                'val_data_path':    str(getattr(cfg, 'val_data_path', '')),
+                'total_samples':    n_samples,
+                'n_vessels':        n_vessels,
+                'n_batches':        n_batches,
+                'eval_duration_s':  round(eval_duration, 1),
+                'ms_per_sample':    round(eval_duration / n_samples * 1000, 2) if n_samples else 0,
+                'ms_per_batch':     round(eval_duration / n_batches * 1000, 1) if n_batches else 0,
+                'samples_per_sec':  round(n_samples / eval_duration, 1) if eval_duration else 0,
+                # Overall metrics
+                'mean_ade':   round(float(all_ade.mean()), 3),
+                'std_ade':    round(float(all_ade.std()), 3),
+                'p50_ade':    round(float(np.percentile(all_ade, 50)), 3),
+                'p90_ade':    round(float(np.percentile(all_ade, 90)), 3),
+                'p95_ade':    round(float(np.percentile(all_ade, 95)), 3),
+                'mean_fde':   round(float(all_fde.mean()), 3),
+                'std_fde':    round(float(all_fde.std()), 3),
+                'p50_fde':    round(float(np.percentile(all_fde, 50)), 3),
+                'p90_fde':    round(float(np.percentile(all_fde, 90)), 3),
+                'p95_fde':    round(float(np.percentile(all_fde, 95)), 3),
+                'miss_2m':    round(float((all_fde > 2.0).mean()) * 100, 1),
+                'miss_4m':    round(float((all_fde > 4.0).mean()) * 100, 1),
+                'miss_8m':    round(float((all_fde > 8.0).mean()) * 100, 1),
+                'per_bin':      per_bin,
+                'per_vessel':   per_vessel_list,
+                # Chart data
+                'cdf_x':        cdf_x,
+                'cdf_y':        cdf_y,
+                'hist_labels':  hist_labels_list,
+                'hist_counts':  hist_counts_list,
+            }
+
+            report_path = create_report(
+                report_data=report_data,
+                output_dir=self.output_dir,
+            )
+
             print(f"\n   ── HTML Visualizations ──────────────────────────────────────")
             print(f"   {len(created_files)} vessel files in {os.path.abspath(self.output_dir)}/")
-            print(f"   Each shows: GT trajectory + prediction fan (every {VIZ_STRIDE}s, blue→red)")
-            print(f"🌐 Open any file in browser to view interactive map")
+            print(f"   📋 Report: {os.path.abspath(report_path)}")
+            print(f"🌐 Open report.html in browser to view full evaluation summary")
 
         except Exception as e:
             logger.error(f"Failed to create visualizations: {str(e)}")
