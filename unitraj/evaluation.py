@@ -2,11 +2,13 @@ import pytorch_lightning as pl
 import torch
 import numpy as np
 import os
-import json
+import time
+from datetime import datetime
 from typing import Dict, List, Any, Optional
 import logging
 
 torch.set_float32_matmul_precision('medium')
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
 from models import build_model
@@ -15,137 +17,58 @@ from utils.utils import set_seed
 import hydra
 from omegaconf import OmegaConf
 from visualizations.viz_leaflet import LeafletVisualizer
+from benchmark.report import create_report
 
 logger = logging.getLogger(__name__)
 
 
 class EvaluationCallback(pl.Callback):
-    """Custom callback to collect predictions and ground truth for visualization"""
+    """Callback to collect per-window predictions and compute dense evaluation metrics."""
 
     def __init__(self, config=None):
         super().__init__()
-        self.predictions = []
-        self.ground_truths = []
-        self.scenario_ids = []
-        self.scene_context = []  # Store multi-agent scene data
-        self.metrics = {}
+        self.vessel_pred_windows = {}    # {vessel_id: [(time_offset, pred_norm[T,2])]}
+        self.all_sample_metrics = []     # [{vessel_id, time_offset, min_ade_m, min_fde_m, miss}]
+        self.vessel_first_gt = {}        # {vessel_id: gt_norm [T,2]} — GT for first window only
+        self.vessel_first_scene_ctx = {} # {vessel_id: scene_context dict} — first window only
         self.output_dir = "evaluation_visualizations"
-        self.config = config  # Store config to access data paths
+        self.config = config
+        self._eval_start_time = None
+        self._batch_count = 0
         os.makedirs(self.output_dir, exist_ok=True)
-    
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        self._eval_start_time = time.time()
+        self._batch_count = 0
+
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
-        """Collect predictions and ground truth from each batch"""
+        """Collect lean GPU metrics and per-window predictions."""
+        self._batch_count += 1
         try:
-            # Get prediction from the model's forward pass
             input_dict = batch['input_dict']
             prediction, loss = pl_module.forward(batch)
 
-            # Extract predictions - shape: [batch_size, num_modes, future_len, 2]
-            pred_trajs = prediction['predicted_trajectory']  # [B, num_modes, T, 2]
-            # Take the best mode (mode 0) for visualization
-            pred_trajs_best = pred_trajs[:, 0, :, :2]  # [B, T, 2]
+            pred_trajs = prediction['predicted_trajectory']  # [B, C, T, 2]
+            position_scale = getattr(pl_module.config, 'position_scale', 100.0)
+            past_len = getattr(pl_module.config, 'past_len', 300)
 
-            # Extract ground truth - shape: [batch_size, future_len, 2]
-            if 'center_gt_trajs' in input_dict and input_dict['center_gt_trajs'] is not None:
-                gt_trajs = input_dict['center_gt_trajs'][:, :, :2]  # [B, T, 2]
-            else:
-                # Fallback: extract future trajectory from obj_trajs if center_gt_trajs is missing
-                track_idx = input_dict.get('track_index_to_predict', torch.tensor([0]))[0]
-                if isinstance(track_idx, torch.Tensor):
-                    track_idx = track_idx.item()
-                obj_trajs = input_dict['obj_trajs']  # [B, num_agents, timesteps, features]
+            # Require center_gt_trajs for metrics
+            if 'center_gt_trajs' not in input_dict or input_dict['center_gt_trajs'] is None:
+                return
+            gt_trajs = input_dict['center_gt_trajs'][:, :, :2]  # [B, T, 2]
 
-                # Get config values for past and future lengths
-                past_len = getattr(pl_module.config, 'past_len', 21)
-                future_len = getattr(pl_module.config, 'future_len', 60)
+            # Per-sample min-ADE / min-FDE on GPU
+            pred_xy = pred_trajs[:, :, :, :2]              # [B, C, T, 2]
+            gt_xy = gt_trajs.unsqueeze(1)                   # [B, 1, T, 2]
+            ade_per_mode = torch.norm(pred_xy - gt_xy, dim=-1).mean(dim=-1)        # [B, C]
+            fde_per_mode = torch.norm(pred_xy[:, :, -1, :] - gt_xy[:, :, -1, :], dim=-1)  # [B, C]
+            min_ade_m = (ade_per_mode.min(1).values * position_scale).cpu().numpy()  # [B]
+            min_fde_m = (fde_per_mode.min(1).values * position_scale).cpu().numpy()  # [B]
+            miss = (min_fde_m > 2.0)  # [B] bool
 
-                # Extract future part of the ego agent trajectory
-                ego_traj = obj_trajs[0, track_idx, :, :]  # [timesteps, features]
-                if ego_traj.shape[0] > past_len:
-                    # Get future trajectory: [future_len, 2] for x,y coordinates
-                    future_end_idx = min(past_len + future_len, ego_traj.shape[0])
-                    future_traj = ego_traj[past_len:future_end_idx, 1:3]  # Skip time (index 0), get x,y (indices 1,2)
-
-                    # Pad if necessary to match expected future_len
-                    if future_traj.shape[0] < future_len:
-                        padding = torch.zeros(future_len - future_traj.shape[0], 2)
-                        future_traj = torch.cat([future_traj, padding], dim=0)
-
-                    gt_trajs = future_traj.unsqueeze(0)  # Add batch dimension: [1, future_len, 2]
-                else:
-                    # Create dummy ground truth if not enough data
-                    gt_trajs = torch.zeros(1, future_len, 2)
-
-            # Extract PAST trajectories for visualization (history)
-            past_len = getattr(pl_module.config, 'past_len', 21)
-            batch_size = pred_trajs_best.shape[0]
-            past_trajs_list = []
-
-            for scene_idx in range(batch_size):
-                track_idx = input_dict['track_index_to_predict'][scene_idx].item() if isinstance(input_dict['track_index_to_predict'], torch.Tensor) else input_dict['track_index_to_predict'][scene_idx]
-                # Extract past trajectory (first past_len timesteps)
-                past_traj = input_dict['obj_trajs'][scene_idx, track_idx, :past_len, 0:2]  # [past_len, 2]
-                past_trajs_list.append(past_traj.detach().cpu().numpy())
-
-            past_trajs = np.array(past_trajs_list)  # [B, past_len, 2]
-            
-            # CRITICAL COORDINATE TRANSFORMATION FIX:
-            # The dataset (ais_dataset.py:285-287) transforms ALL coordinates to EGO-RELATIVE:
-            #   reference_position = positions[last_past_idx]  # Last past position (t=59)
-            #   ego_positions_centered = ego_positions - reference_position  # Center on last past
-            #
-            # This means:
-            # - Model was trained on ego-relative targets (relative to last observed position)
-            # - Model outputs ego-relative predictions (relative to last observed position)
-            # - GT in input_dict is ego-relative (relative to last observed position)
-            #
-            # For visualization, we need SCENARIO-RELATIVE coordinates (relative to first position in pickle)
-            # Therefore: scenario_coords = ego_relative_coords + ego_last_pos
-
-            logger.info("AIS data: Converting from ego-relative to scenario-relative coordinates")
-
-            # Get configuration for trajectory lengths
-            past_len = getattr(pl_module.config, 'past_len', 21)
-
-            # Initialize arrays for scenario-relative coordinates
-            pred_trajs_scenario = pred_trajs_best.detach().cpu().numpy().copy()
-            gt_trajs_scenario = gt_trajs.detach().cpu().numpy().copy()
-
-            # Transform predictions and GT from ego-relative to scenario-relative
-            for scene_idx in range(pred_trajs_best.shape[0]):
-                # Get the ego agent's last observed position (the "current time" reference point)
-                track_idx = input_dict['track_index_to_predict'][scene_idx].item()
-                ego_last_pos = input_dict['obj_trajs'][scene_idx, track_idx, past_len-1, 0:2].cpu().numpy()
-
-                logger.info(f"[DEBUG_COORDS] Scene {scene_idx}:")
-                logger.info(f"[DEBUG_COORDS]   ego_last_pos (NORMALIZED): x={ego_last_pos[0]:.6f}, y={ego_last_pos[1]:.6f}")
-                logger.info(f"[DEBUG_COORDS]   Pred BEFORE transform (EGO-REL, NORMALIZED): first 3 points")
-                for i in range(min(3, pred_trajs_scenario.shape[1])):
-                    logger.info(f"[DEBUG_COORDS]     t={i}: x={pred_trajs_scenario[scene_idx, i, 0]:.6f}, y={pred_trajs_scenario[scene_idx, i, 1]:.6f}")
-
-                logger.info(f"[DEBUG_COORDS]   GT BEFORE transform (EGO-REL, NORMALIZED): first 3 points")
-                for i in range(min(3, gt_trajs_scenario.shape[1])):
-                    logger.info(f"[DEBUG_COORDS]     t={i}: x={gt_trajs_scenario[scene_idx, i, 0]:.6f}, y={gt_trajs_scenario[scene_idx, i, 1]:.6f}")
-
-                # Transform: scenario_coords = ego_relative_coords + ego_last_pos
-                pred_trajs_scenario[scene_idx] = pred_trajs_scenario[scene_idx] + ego_last_pos
-                gt_trajs_scenario[scene_idx] = gt_trajs_scenario[scene_idx] + ego_last_pos
-
-                logger.info(f"[DEBUG_COORDS]   Pred AFTER transform (SCENARIO-REL, NORMALIZED): first 3 points")
-                for i in range(min(3, pred_trajs_scenario.shape[1])):
-                    logger.info(f"[DEBUG_COORDS]     t={i}: x={pred_trajs_scenario[scene_idx, i, 0]:.6f}, y={pred_trajs_scenario[scene_idx, i, 1]:.6f}")
-
-                logger.info(f"[DEBUG_COORDS]   GT AFTER transform (SCENARIO-REL, NORMALIZED): first 3 points")
-                for i in range(min(3, gt_trajs_scenario.shape[1])):
-                    logger.info(f"[DEBUG_COORDS]     t={i}: x={gt_trajs_scenario[scene_idx, i, 0]:.6f}, y={gt_trajs_scenario[scene_idx, i, 1]:.6f}")
-
-            pred_trajs_latlon = pred_trajs_scenario
-            gt_trajs_latlon = gt_trajs_scenario
-            
-            # Process each scene individually instead of batching them
-            batch_size = pred_trajs_best.shape[0]
-            scenario_ids = input_dict.get('scenario_id', [f"batch_{batch_idx}_scenario_{i}" for i in range(batch_size)])
-
+            # Parse scenario IDs
+            batch_size = pred_trajs.shape[0]
+            scenario_ids = input_dict.get('scenario_id', [f"batch_{batch_idx}_{i}" for i in range(batch_size)])
             if isinstance(scenario_ids, torch.Tensor):
                 scenario_ids = scenario_ids.cpu().numpy().tolist()
             elif isinstance(scenario_ids, str):
@@ -154,224 +77,278 @@ class EvaluationCallback(pl.Callback):
                 scenario_ids = scenario_ids.tolist()
             elif not isinstance(scenario_ids, (list, tuple)):
                 scenario_ids = [str(scenario_ids)]
-
-            # Ensure scenario_ids is a list of strings
             scenario_ids = [str(sid) for sid in scenario_ids]
 
-            # Process each maritime scene individually
-            for scene_idx in range(batch_size):
-                scenario_id = str(scenario_ids[scene_idx])
+            for i in range(batch_size):
+                scenario_id = scenario_ids[i]
 
-                # Get multi-agent data for this specific scene
-                scene_obj_trajs = input_dict['obj_trajs'][scene_idx]  # [num_agents, timesteps, features]
-                scene_obj_mask = input_dict['obj_trajs_mask'][scene_idx]  # [num_agents, timesteps]
-
-                # NOTE: Maritime scene visualization disabled - using _create_leaflet_visualization instead
-                # which creates the combined vessel trajectory HTML files in on_validation_epoch_end
-                # The Leaflet visualizations show predictions vs ground truth on interactive maps
-                # self._create_maritime_scene_visualization(
-                #     scenario_id,
-                #     scene_obj_trajs,
-                #     scene_obj_mask,
-                #     pred_trajs_latlon[scene_idx:scene_idx+1],
-                #     gt_trajs_latlon[scene_idx:scene_idx+1],
-                #     pl_module
-                # )
-
-            # Keep for compatibility (but won't be used for final visualization)
-            self.predictions.append(pred_trajs_latlon)
-            self.ground_truths.append(gt_trajs_latlon)
-            self.scenario_ids.extend([str(sid) for sid in scenario_ids])
-
-            # Store multi-agent scene context for visualization INCLUDING PAST TRAJECTORIES
-            for scene_idx in range(batch_size):
-                # Get reference position if available (for de-centering ego-relative coordinates)
-                ref_pos = input_dict.get('reference_position')
-                if ref_pos is not None:
-                    ref_pos = ref_pos[scene_idx].detach().cpu().numpy()  # [2]
-                else:
-                    ref_pos = np.zeros(2)
-
-                # Get future GT trajectories for all agents
-                all_agents_gt = input_dict.get('all_agents_gt_trajs')  # [B, num_agents, future_len, 2]
-                all_agents_gt_masks = input_dict.get('all_agents_gt_masks')  # [B, num_agents, future_len]
-
-                if all_agents_gt is not None:
-                    future_gt = all_agents_gt[scene_idx].detach().cpu().numpy()  # [num_agents, future_len, 2]
-                    future_gt_mask = all_agents_gt_masks[scene_idx].detach().cpu().numpy()  # [num_agents, future_len]
-                else:
-                    future_gt = None
-                    future_gt_mask = None
-
-                self.scene_context.append({
-                    'obj_trajs': input_dict['obj_trajs'][scene_idx].detach().cpu().numpy(),  # [num_agents, past_len, features]
-                    'obj_mask': input_dict['obj_trajs_mask'][scene_idx].detach().cpu().numpy(),  # [num_agents, past_len]
-                    'track_idx': input_dict['track_index_to_predict'][scene_idx].item() if isinstance(input_dict['track_index_to_predict'], torch.Tensor) else 0,
-                    'past_traj': past_trajs[scene_idx],  # [past_len, 2] - ego vessel history
-                    'reference_position': ref_pos,  # [2] - centering offset for de-normalization
-                    'future_gt': future_gt,  # [num_agents, future_len, 2] - future GT for all agents
-                    'future_gt_mask': future_gt_mask  # [num_agents, future_len] - validity mask
-                })
-            
-        except Exception as e:
-            logger.warning(f"Failed to collect batch data for visualization: {str(e)}")
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        """Process collected data and create visualization"""
-        if not self.predictions or not self.ground_truths:
-            logger.warning("No prediction data collected for visualization")
-            return
-        
-        try:
-            leaflet_viz = LeafletVisualizer(config=self.config)
-
-            # Concatenate all batches
-            all_predictions = np.concatenate(self.predictions, axis=0)
-            all_ground_truths = np.concatenate(self.ground_truths, axis=0)
-            
-            # Ensure we have matching scenario IDs
-            num_scenarios = all_predictions.shape[0]
-            if len(self.scenario_ids) < num_scenarios:
-                # Pad with generic IDs if needed
-                for i in range(len(self.scenario_ids), num_scenarios):
-                    self.scenario_ids.append(f"scenario_{i}")
-            elif len(self.scenario_ids) > num_scenarios:
-                # Trim if too many
-                self.scenario_ids = self.scenario_ids[:num_scenarios]
-            
-            # Get metrics from trainer logs
-            if hasattr(trainer, 'logged_metrics'):
-                self.metrics = {k: float(v) for k, v in trainer.logged_metrics.items() 
-                              if isinstance(v, (int, float, torch.Tensor))}
-            
-            logger.info(f"Creating visualizations for {all_predictions.shape[0]} scenarios")
-            logger.info(f"Prediction shape: {all_predictions.shape}")
-            logger.info(f"Ground truth shape: {all_ground_truths.shape}")
-            
-            # Group scenarios by vessel (remove time suffix _tXXXXX)
-            vessel_groups = {}
-            for i in range(num_scenarios):
-                scenario_id = self.scenario_ids[i]
-                # Extract vessel name (everything before the last _tXXXXX)
-                # Format: ais_{vessel_name}_{date}_{time}_t{offset}
+                # Parse vessel_id and time_offset from scenario_id (format: …_tXXXXX)
                 if '_t' in scenario_id:
-                    vessel_id = scenario_id.rsplit('_t', 1)[0]  # Remove _tXXXXX suffix
+                    vessel_id = scenario_id.rsplit('_t', 1)[0]
+                    try:
+                        time_offset = int(scenario_id.rsplit('_t', 1)[1])
+                    except ValueError:
+                        time_offset = 0
                 else:
                     vessel_id = scenario_id
+                    time_offset = 0
 
-                if vessel_id not in vessel_groups:
-                    vessel_groups[vessel_id] = {
-                        'indices': [],
-                        'predictions': [],
-                        'ground_truths': []
+                # Store normalized ego-relative prediction (mode 0, best mode)
+                pred_norm = pred_trajs[i, 0, :, :2].detach().cpu().numpy()  # [T, 2]
+                gt_norm = gt_trajs[i].detach().cpu().numpy()                 # [T, 2]
+
+                self.vessel_pred_windows.setdefault(vessel_id, []).append((time_offset, pred_norm))
+
+                self.all_sample_metrics.append({
+                    'vessel_id': vessel_id,
+                    'time_offset': time_offset,
+                    'min_ade_m': float(min_ade_m[i]),
+                    'min_fde_m': float(min_fde_m[i]),
+                    'miss': bool(miss[i]),
+                })
+
+                # Store first window's data for visualization (GT + scene context)
+                if vessel_id not in self.vessel_first_gt:
+                    self.vessel_first_gt[vessel_id] = gt_norm
+
+                    track_idx = (input_dict['track_index_to_predict'][i].item()
+                                 if isinstance(input_dict['track_index_to_predict'], torch.Tensor)
+                                 else int(input_dict['track_index_to_predict'][i]))
+
+                    ref_pos_raw = input_dict.get('reference_position')
+                    ref_pos = (ref_pos_raw[i].detach().cpu().numpy()
+                               if ref_pos_raw is not None else np.zeros(2))
+
+                    all_agents_gt = input_dict.get('all_agents_gt_trajs')
+                    all_agents_gt_masks = input_dict.get('all_agents_gt_masks')
+
+                    self.vessel_first_scene_ctx[vessel_id] = {
+                        'obj_trajs': input_dict['obj_trajs'][i].detach().cpu().numpy(),
+                        'obj_mask': input_dict['obj_trajs_mask'][i].detach().cpu().numpy(),
+                        'track_idx': track_idx,
+                        'past_traj': input_dict['obj_trajs'][i, track_idx, :past_len, 0:2].detach().cpu().numpy(),
+                        'reference_position': ref_pos,
+                        'future_gt': (all_agents_gt[i].detach().cpu().numpy()
+                                      if all_agents_gt is not None else None),
+                        'future_gt_mask': (all_agents_gt_masks[i].detach().cpu().numpy()
+                                           if all_agents_gt_masks is not None else None),
                     }
 
-                vessel_groups[vessel_id]['indices'].append(i)
-                vessel_groups[vessel_id]['predictions'].append(all_predictions[i])
-                vessel_groups[vessel_id]['ground_truths'].append(all_ground_truths[i])
+        except Exception as e:
+            logger.warning(f"Failed to collect batch data: {str(e)}")
 
-            logger.info(f"Grouped {num_scenarios} scenarios into {len(vessel_groups)} unique vessels")
+    def on_validation_epoch_end(self, trainer, pl_module):
+        """Compute aggregate + per-timestamp metrics, then create visualizations and report."""
+        if not self.all_sample_metrics:
+            logger.warning("No metrics collected for visualization")
+            return
 
-            # Create combined visualization for each vessel
-            output_dir = "evaluation_visualizations"
-            os.makedirs(output_dir, exist_ok=True)
+        eval_duration = time.time() - self._eval_start_time if self._eval_start_time else 0
+
+        try:
+            all_ade  = np.array([s['min_ade_m'] for s in self.all_sample_metrics])
+            all_fde  = np.array([s['min_fde_m'] for s in self.all_sample_metrics])
+            all_miss = np.array([s['miss'] for s in self.all_sample_metrics], dtype=float)
+            n_samples = len(self.all_sample_metrics)
+            n_vessels = len(self.vessel_pred_windows)
+            n_batches = self._batch_count
+
+            # --- Per-timestamp bins ---
+            bins       = [0, 60, 120, 180, 240, 300, 400, 500, 600, 9999]
+            bin_labels = ['0–60s', '60–120s', '120–180s', '180–240s',
+                          '240–300s', '300–400s', '400–500s', '500–600s', '600+s']
+            per_bin = []
+            for j, (lo, hi) in enumerate(zip(bins, bins[1:])):
+                mask = np.array([lo <= s['time_offset'] < hi for s in self.all_sample_metrics])
+                if mask.sum() > 0:
+                    per_bin.append({
+                        'label':   bin_labels[j],
+                        'count':   int(mask.sum()),
+                        'ade':     float(all_ade[mask].mean()),
+                        'fde':     float(all_fde[mask].mean()),
+                        'miss':    float(all_miss[mask].mean()) * 100,
+                        'miss_4m': float((all_fde[mask] > 4.0).mean()) * 100,
+                        'miss_8m': float((all_fde[mask] > 8.0).mean()) * 100,
+                    })
+
+            # --- Per-vessel metrics ---
+            vessel_metrics_map = {}
+            for m in self.all_sample_metrics:
+                vid = m['vessel_id']
+                vessel_metrics_map.setdefault(vid, {'ade': [], 'fde': [], 'miss': []})
+                vessel_metrics_map[vid]['ade'].append(m['min_ade_m'])
+                vessel_metrics_map[vid]['fde'].append(m['min_fde_m'])
+                vessel_metrics_map[vid]['miss'].append(float(m['miss']))
+
+            # --- Print summary ---
+            print(f"\n📊 Dense Evaluation — Val Scenes (stride=1)")
+            print(f"   Samples: {n_samples:>8,}  |  Vessels: {n_vessels}  |  Batches: {n_batches:,}")
+            print(f"   Inference: {eval_duration:.1f}s total  |  {eval_duration/n_samples*1000:.1f}ms/sample  |  {n_samples/eval_duration:.0f} samples/s")
+            print(f"\n   ── Overall ──────────────────────────────────────────────────")
+            print(f"   minADE6: {all_ade.mean():.2f} m   |  minFDE6: {all_fde.mean():.2f} m  |  Miss@2m: {all_miss.mean()*100:.1f}%")
+            print(f"\n   ── By Time Offset (prediction start) ────────────────────────")
+            print(f"   {'Phase':<14}  {'Samples':>8}  {'minADE6':>8}  {'minFDE6':>8}  {'Miss%':>7}")
+            print(f"   {'-'*58}")
+            for s in per_bin:
+                print(f"   t={s['label']:<12}  {s['count']:>8,}  {s['ade']:>8.2f}  {s['fde']:>8.2f}  {s['miss']:>7.1f}%")
+
+            # --- Visualizations ---
+            # VIZ_STRIDE=1: show every eval window (stride=60 already limits count).
+            # Higher values skip windows → big gaps between prediction updates in viz.
+            VIZ_STRIDE = 1
+            leaflet_viz = LeafletVisualizer(config=self.config)
 
             created_files = []
+            per_vessel_list = []
 
-            for vessel_id, data in vessel_groups.items():
-                # OPTION 1: Show only FIRST prediction for clean visualization
-                # This avoids the "cloud of waypoints" issue from concatenating overlapping predictions
-                # Note: Timeline visualization (*_timeline.html) still shows all predictions as a fan
-
-                # Use only the first time window prediction
-                if len(data['predictions']) > 0:
-                    pred_first = data['predictions'][0]  # [future_len, 2] - first prediction only
-                    gt_first = data['ground_truths'][0]    # [future_len, 2] - corresponding GT
-
-                    # Reshape to [1, future_len, 2] for visualization function
-                    combined_predictions = pred_first.reshape(1, -1, 2)
-                    combined_ground_truths = gt_first.reshape(1, -1, 2)
-                else:
-                    # Fallback: empty predictions
-                    logger.warning(f"No predictions found for vessel {vessel_id}")
+            for vessel_id, windows in self.vessel_pred_windows.items():
+                sorted_windows = sorted(windows, key=lambda x: x[0])
+                display_windows = sorted_windows[::VIZ_STRIDE]
+                if not display_windows:
                     continue
 
-                # Clean vessel ID for filename
-                clean_vessel_id = "".join(c for c in vessel_id if c.isalnum() or c in ('-', '_')).rstrip()
-                if not clean_vessel_id:
-                    clean_vessel_id = f"vessel_{len(created_files)}"
+                first_time_offset, first_pred_norm = display_windows[0]
+                first_gt_norm = self.vessel_first_gt.get(vessel_id)
+                if first_gt_norm is None:
+                    continue
 
-                # Limit filename length to avoid filesystem issues
-                max_id_length = 50
-                if len(clean_vessel_id) > max_id_length:
-                    clean_vessel_id = f"{clean_vessel_id[:max_id_length-10]}_{hash(vessel_id) % 10000:04d}"
+                # Per-vessel metrics for individual viz sidebar
+                vm = vessel_metrics_map.get(vessel_id, {})
+                scene_metrics = {}
+                if vm:
+                    scene_metrics = {
+                        'val/minADE6':   float(np.mean(vm['ade'])),
+                        'val/minFDE6':   float(np.mean(vm['fde'])),
+                        'val/miss_rate': float(np.mean(vm['miss'])),
+                    }
 
-                output_filename = f"ais_vessel_{clean_vessel_id}.html"
+                scenario_id_with_t = f"{vessel_id}_t{first_time_offset}"
+                scene_ctx = self.vessel_first_scene_ctx.get(vessel_id)
 
-                # Get first scene context for this vessel (all segments share same scene structure)
-                scene_ctx = self.scene_context[data['indices'][0]] if data['indices'] and data['indices'][0] < len(self.scene_context) else None
+                clean_id = "".join(c for c in vessel_id if c.isalnum() or c in ('-', '_')).rstrip()
+                if not clean_id:
+                    clean_id = f"vessel_{len(created_files)}"
+                if len(clean_id) > 50:
+                    clean_id = f"{clean_id[:40]}_{hash(vessel_id) % 10000:04d}"
 
+                output_filename = f"ais_vessel_{clean_id}.html"
                 output_path = leaflet_viz.create_visualization(
-                    predictions=combined_predictions,
-                    ground_truth=combined_ground_truths,
-                    scenario_id=vessel_id,
-                    output_dir=output_dir,
+                    predictions=first_pred_norm.reshape(1, -1, 2),
+                    ground_truth=first_gt_norm.reshape(1, -1, 2),
+                    scenario_id=scenario_id_with_t,
+                    output_dir=self.output_dir,
                     output_filename=output_filename,
-                    metrics=self.metrics,
-                    scene_context=scene_ctx
+                    metrics=scene_metrics,
+                    scene_context=scene_ctx,
+                    prediction_windows=display_windows,
+                    viz_stride=VIZ_STRIDE,
                 )
-                
                 created_files.append(output_path)
-                logger.info(f"✅ Created combined visualization for vessel {vessel_id}: {output_filename}")
-            
-            logger.info(f"🎉 Created {len(created_files)} scenario visualizations")
-            print(f"\n🚢 AIS Trajectory Visualizations Generated!")
-            print(f"📁 Location: {os.path.abspath(output_dir)}")
-            print(f"📄 Files created:")
-            for file_path in created_files:
-                print(f"   • {os.path.basename(file_path)}")
-            print(f"🌐 Open any file in browser to view interactive map")
+                logger.info(f"✅ Created viz for vessel {vessel_id}")
 
-            # Create timeline visualizations (combine predictions from all time windows)
-            logger.info("Creating timeline visualizations...")
-            timeline_files = leaflet_viz.create_timeline_visualizations(output_dir)
-            if timeline_files:
-                print(f"\n🕒 Timeline Visualizations Generated!")
-                print(f"📄 Combined timeline files:")
-                for file_path in timeline_files:
-                    print(f"   • {os.path.basename(file_path)}")
+                per_vessel_list.append({
+                    'vessel_id':   vessel_id,
+                    'samples':     len(vm.get('ade', [])),
+                    'ade':         float(np.mean(vm['ade'])) if vm else 0.0,
+                    'fde':         float(np.mean(vm['fde'])) if vm else 0.0,
+                    'miss':        float(np.mean(vm['miss'])) * 100 if vm else 0.0,
+                    'p90_fde':     float(np.percentile(vm['fde'], 90)) if vm else 0.0,
+                    'html_file':   output_filename,
+                })
+
+            # --- FDE CDF (150 sample points) ---
+            sorted_fde = np.sort(all_fde)
+            p99_fde = float(np.percentile(all_fde, 99))
+            cdf_x_arr = np.linspace(0, p99_fde, 150)
+            cdf_x = [round(float(v), 3) for v in cdf_x_arr]
+            cdf_y = [round(float((sorted_fde <= v).mean() * 100), 2) for v in cdf_x_arr]
+
+            # --- ADE histogram ---
+            hist_edges = [0, 0.5, 1, 2, 3, 5, 8, 12, 20, 9999]
+            hist_labels_list = ['0–0.5', '0.5–1', '1–2', '2–3', '3–5', '5–8', '8–12', '12–20', '20+']
+            hist_counts_list = [
+                int(((all_ade >= hist_edges[k]) & (all_ade < hist_edges[k + 1])).sum())
+                for k in range(len(hist_labels_list))
+            ]
+
+            # --- Generate aggregate report ---
+            cfg = self.config
+            report_data = {
+                'timestamp':        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'exp_name':         str(getattr(cfg, 'exp_name', 'unknown')),
+                'ckpt_path':        str(getattr(cfg, 'ckpt_path', 'unknown')),
+                'stride':           int(getattr(cfg, 'stride', 1)),
+                'past_len':         int(getattr(cfg, 'past_len', 300)),
+                'future_len':       int(getattr(cfg, 'future_len', 60)),
+                'eval_batch_size':  int(getattr(cfg, 'eval_batch_size', 96)),
+                'load_num_workers': int(getattr(cfg, 'load_num_workers', 8)),
+                'val_data_path':    str(getattr(cfg, 'val_data_path', '')),
+                'total_samples':    n_samples,
+                'n_vessels':        n_vessels,
+                'n_batches':        n_batches,
+                'eval_duration_s':  round(eval_duration, 1),
+                'ms_per_sample':    round(eval_duration / n_samples * 1000, 2) if n_samples else 0,
+                'ms_per_batch':     round(eval_duration / n_batches * 1000, 1) if n_batches else 0,
+                'samples_per_sec':  round(n_samples / eval_duration, 1) if eval_duration else 0,
+                # Overall metrics
+                'mean_ade':   round(float(all_ade.mean()), 3),
+                'std_ade':    round(float(all_ade.std()), 3),
+                'p50_ade':    round(float(np.percentile(all_ade, 50)), 3),
+                'p90_ade':    round(float(np.percentile(all_ade, 90)), 3),
+                'p95_ade':    round(float(np.percentile(all_ade, 95)), 3),
+                'mean_fde':   round(float(all_fde.mean()), 3),
+                'std_fde':    round(float(all_fde.std()), 3),
+                'p50_fde':    round(float(np.percentile(all_fde, 50)), 3),
+                'p90_fde':    round(float(np.percentile(all_fde, 90)), 3),
+                'p95_fde':    round(float(np.percentile(all_fde, 95)), 3),
+                'miss_2m':    round(float((all_fde > 2.0).mean()) * 100, 1),
+                'miss_4m':    round(float((all_fde > 4.0).mean()) * 100, 1),
+                'miss_8m':    round(float((all_fde > 8.0).mean()) * 100, 1),
+                'per_bin':      per_bin,
+                'per_vessel':   per_vessel_list,
+                # Chart data
+                'cdf_x':        cdf_x,
+                'cdf_y':        cdf_y,
+                'hist_labels':  hist_labels_list,
+                'hist_counts':  hist_counts_list,
+            }
+
+            report_path = create_report(
+                report_data=report_data,
+                output_dir=self.output_dir,
+            )
+
+            print(f"\n   ── HTML Visualizations ──────────────────────────────────────")
+            print(f"   {len(created_files)} vessel files in {os.path.abspath(self.output_dir)}/")
+            print(f"   📋 Report: {os.path.abspath(report_path)}")
+            print(f"🌐 Open report.html in browser to view full evaluation summary")
 
         except Exception as e:
-            logger.error(f"Failed to create visualization: {str(e)}")
+            logger.error(f"Failed to create visualizations: {str(e)}")
             import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            print(f"❌ Visualization creation failed: {str(e)}")
+            logger.error(traceback.format_exc())
         finally:
-            # Clean up collected data
-            self.predictions = []
-            self.ground_truths = []
-            self.scenario_ids = []
-        self.scene_context = []  # Store multi-agent scene data
+            self.vessel_pred_windows = {}
+            self.all_sample_metrics = []
+            self.vessel_first_gt = {}
+            self.vessel_first_scene_ctx = {}
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def evaluation(cfg):
     set_seed(cfg.seed)
-    OmegaConf.set_struct(cfg, False)  # Open the struct
+    OmegaConf.set_struct(cfg, False)
     cfg = OmegaConf.merge(cfg, cfg.method)
     cfg['eval'] = True
 
     model = build_model(cfg)
-
     val_set = build_dataset(cfg, val=True)
-
     eval_batch_size = cfg.method['eval_batch_size']
 
     val_loader = DataLoader(
-        val_set, batch_size=eval_batch_size, num_workers=cfg.load_num_workers, shuffle=False, drop_last=False,
-        collate_fn=val_set.collate_fn)
+        val_set, batch_size=eval_batch_size, num_workers=cfg.load_num_workers,
+        shuffle=False, drop_last=False, collate_fn=val_set.collate_fn)
 
-    # Create visualization callback with config
     viz_callback = EvaluationCallback(config=cfg)
 
     trainer = pl.Trainer(
@@ -380,20 +357,18 @@ def evaluation(cfg):
         devices=1,
         accelerator="cpu" if cfg.debug else "gpu",
         profiler="simple",
-        callbacks=[viz_callback]  # Add visualization callback
+        callbacks=[viz_callback],
     )
 
-    # Run evaluation
     results = trainer.validate(model=model, dataloaders=val_loader, ckpt_path=cfg.ckpt_path)
-    
-    # Print results summary
+
     if results:
         print(f"\n📊 Evaluation Results:")
         for result_dict in results:
             for key, value in result_dict.items():
                 if isinstance(value, (int, float)):
                     print(f"   {key}: {value:.4f}")
-    
+
     return results
 
 

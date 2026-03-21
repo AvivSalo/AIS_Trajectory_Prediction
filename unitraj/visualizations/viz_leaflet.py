@@ -328,8 +328,9 @@ class LeafletVisualizer:
     <script>
         var map = L.map('map').setView([{center_lat}, {center_lon}], 10);
 
-        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-            attribution: '&copy; OpenStreetMap contributors'
+        L.tileLayer('https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/">CARTO</a>',
+            maxZoom: 20
         }}).addTo(map);
 
         var allLayers = [];
@@ -615,6 +616,27 @@ class LeafletVisualizer:
         logger.warning(f"Could not find original pickle file for scenario: {scenario_id}")
         return None
 
+    def _get_gradient_color(self, t: float) -> str:
+        """Return a hex color on a blue→green→red gradient.
+
+        Args:
+            t: Normalized position 0.0 (blue/early) → 1.0 (red/late)
+        """
+        t = max(0.0, min(1.0, t))
+        if t < 0.5:
+            # blue → green
+            u = t / 0.5
+            r = 0
+            g = int(255 * u)
+            b = int(255 * (1 - u))
+        else:
+            # green → red
+            u = (t - 0.5) / 0.5
+            r = int(255 * u)
+            g = int(255 * (1 - u))
+            b = 0
+        return f'#{r:02x}{g:02x}{b:02x}'
+
     def create_visualization(
         self,
         predictions: np.ndarray,
@@ -623,7 +645,9 @@ class LeafletVisualizer:
         output_dir: str,
         output_filename: str,
         metrics: Optional[Dict[str, float]] = None,
-        scene_context: Optional[Dict] = None
+        scene_context: Optional[Dict] = None,
+        prediction_windows=None,
+        viz_stride: int = 1,
     ) -> str:
         """
         Create Leaflet-based HTML visualization for a single scenario
@@ -975,8 +999,42 @@ class LeafletVisualizer:
             else:
                 center_lat, center_lon = ref_lat, ref_lon
 
+            # --- Prediction fan data (multi-window, blue→red gradient) ---
+            pred_fan_data = []
+            if prediction_windows is not None and pickle_data is not None:
+                _tracks = pickle_data['tracks']
+                _track_ids = list(_tracks.keys())
+                if predicted_idx < len(_track_ids):
+                    _ego_positions = _tracks[_track_ids[predicted_idx]]['state']['position']
+                    _pos_scale = getattr(self.config, 'position_scale', 100.0) if self.config else 100.0
+                    n_wins = len(prediction_windows)
+                    for win_i, (win_t, pred_norm) in enumerate(prediction_windows):
+                        last_obs = win_t + past_len - 1
+                        if last_obs >= len(_ego_positions):
+                            continue
+                        ego_abs_x, ego_abs_y = _ego_positions[last_obs]
+                        # Anchor: vessel's absolute position at prediction start
+                        anchor_lat, anchor_lon = self._meters_to_latlon(
+                            float(ego_abs_x), float(ego_abs_y), ref_lat, ref_lon)
+                        fan_coords = []
+                        for px, py in pred_norm:
+                            if not (np.isnan(px) or np.isnan(py)):
+                                abs_x = float(px) * _pos_scale + float(ego_abs_x)
+                                abs_y = float(py) * _pos_scale + float(ego_abs_y)
+                                fan_lat, fan_lon = self._meters_to_latlon(abs_x, abs_y, ref_lat, ref_lon)
+                                fan_coords.append([float(fan_lat), float(fan_lon)])
+                        if fan_coords:
+                            t_norm = win_i / max(n_wins - 1, 1)
+                            pred_fan_data.append({
+                                'color': self._get_gradient_color(t_norm),
+                                'coords': fan_coords,
+                                'anchor': [float(anchor_lat), float(anchor_lon)],
+                                'time_offset': int(win_t),
+                            })
+
         else:
             # Single-agent mode (backward compatibility)
+            pred_fan_data = []  # no fan in single-agent mode
             pred_coords = []
             for x, y in predictions[0]:
                 if not (np.isnan(x) or np.isnan(y)):
@@ -1006,16 +1064,29 @@ class LeafletVisualizer:
             all_vessel_ids = [0]
             predicted_vessel_color = vessel_colors[0]
 
-        # Format metrics for display
+        # Format metrics — show only 4 core metrics, deduplicated
+        _core_metric_keys = ['val/minADE6', 'val/minFDE6', 'val/miss_rate', 'val/brier_fde']
+        _metric_labels = {
+            'val/minADE6':    ('minADE6',    'm',  '#3b82f6'),
+            'val/minFDE6':    ('minFDE6',    'm',  '#8b5cf6'),
+            'val/miss_rate':  ('Miss Rate',  '',   '#ef4444'),
+            'val/brier_fde':  ('Brier FDE',  'm',  '#f59e0b'),
+        }
         metrics_html = ""
         if metrics:
-            metrics_html = "<div class='metrics'><h4>Evaluation Metrics</h4>"
-            for key, value in metrics.items():
-                if isinstance(value, (int, float)):
-                    metrics_html += f"<p><strong>{key}:</strong> {value:.4f}</p>"
-                else:
-                    metrics_html += f"<p><strong>{key}:</strong> {value}</p>"
-            metrics_html += "</div>"
+            metrics_html = "<div class='metrics'><div class='metrics-title'>Evaluation Metrics</div><div class='metrics-grid'>"
+            for key in _core_metric_keys:
+                if key in metrics:
+                    val = metrics[key]
+                    label, unit, color = _metric_labels[key]
+                    display = f"{val*100:.1f}%" if key == 'val/miss_rate' else f"{val:.2f}{unit}"
+                    metrics_html += (
+                        f"<div class='metric-card'>"
+                        f"<div class='metric-value' style='color:{color}'>{display}</div>"
+                        f"<div class='metric-label'>{label}</div>"
+                        f"</div>"
+                    )
+            metrics_html += "</div></div>"
 
         # Define variables for HTML template (ensure they're available in both single/multi-agent modes)
         if scene_context is not None:
@@ -1028,6 +1099,17 @@ class LeafletVisualizer:
             total_timesteps = 0
             all_vessel_timeline_data = []
             window_start_idx = 0
+
+        # Build step options: all standard steps >= viz_stride
+        _all_steps = [(1, '1s'), (5, '5s'), (10, '10s'), (30, '30s'),
+                      (60, '1min'), (300, '5min'), (600, '10min')]
+        _valid_steps = [(v, lbl) for v, lbl in _all_steps if v >= viz_stride]
+        # default selection: first step >= viz_stride
+        _default_step = _valid_steps[0][0] if _valid_steps else viz_stride
+        _step_options_html = '\n'.join(
+            f'                <option value="{v}"{" selected" if v == _default_step else ""}>{lbl}</option>'
+            for v, lbl in _valid_steps
+        )
 
         html_template = f'''<!DOCTYPE html>
 <html>
@@ -1043,45 +1125,147 @@ class LeafletVisualizer:
             integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 
     <style>
-        body {{ margin: 0; padding: 0; font-family: Arial, sans-serif; }}
-        #map {{ height: {'calc(100vh - 140px)' if total_timesteps > 0 else '100vh'}; width: 100%; }}
-        .info-panel {{
-            position: absolute;
-            top: 10px;
-            right: 10px;
-            background: rgba(255, 255, 255, 0.95);
-            padding: 15px;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
-            z-index: 1000;
-            max-width: 320px;
-            max-height: 80vh;
-            overflow-y: auto;
+        * {{ box-sizing: border-box; }}
+        body {{
+            margin: 0; padding: 0;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            background: #0f172a;
         }}
-        .info-panel h3 {{ margin-top: 0; color: #2c5aa0; }}
-        .legend-item {{
+        .main-layout {{
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+            height: {'calc(100vh - 110px)' if total_timesteps > 0 else '100vh'};
+        }}
+        #map {{ flex: 1; height: 100%; min-width: 0; }}
+        .sidebar {{
+            width: 300px;
+            flex-shrink: 0;
+            background: #1e293b;
+            color: #e2e8f0;
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+            border-left: 1px solid #334155;
+        }}
+        .sidebar-section {{
+            padding: 14px 16px;
+            border-bottom: 1px solid #334155;
+        }}
+        .sidebar-title {{
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: #64748b;
+            margin: 0 0 10px 0;
+        }}
+        .scenario-name {{
+            font-size: 12px;
+            color: #94a3b8;
+            word-break: break-all;
+            line-height: 1.4;
+        }}
+        .model-badge {{
+            display: inline-block;
+            background: #1d4ed8;
+            color: white;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 12px;
+            margin-top: 6px;
+        }}
+        /* Metrics cards */
+        .metrics {{ }}
+        .metrics-title {{
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: #64748b;
+            margin: 0 0 10px 0;
+        }}
+        .metrics-grid {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }}
+        .metric-card {{
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 10px 10px 8px;
+            text-align: center;
+        }}
+        .metric-value {{
+            font-size: 20px;
+            font-weight: 700;
+            line-height: 1.1;
+        }}
+        .metric-label {{
+            font-size: 10px;
+            color: #64748b;
+            margin-top: 3px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }}
+        /* Legend */
+        .legend-row {{
             display: flex;
             align-items: center;
-            margin: 8px 0;
+            gap: 10px;
+            margin: 6px 0;
+            font-size: 12px;
+            color: #cbd5e1;
         }}
-        .legend-color {{
-            width: 20px;
-            height: 4px;
-            margin-right: 10px;
+        .legend-line {{
+            width: 32px;
+            height: 3px;
             border-radius: 2px;
+            flex-shrink: 0;
         }}
-        .ground-truth {{ background-color: #228B22; }}
-        .prediction {{ background-color: #FF4500; }}
-        .vessel-point {{ background-color: #1E90FF; }}
+        .legend-dot {{
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            flex-shrink: 0;
+            border: 2px solid rgba(255,255,255,0.4);
+        }}
+        .legend-line-dash {{
+            width: 32px;
+            height: 0;
+            border-top: 3px dashed;
+            flex-shrink: 0;
+        }}
+        .vessel-row {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 5px 0;
+            font-size: 12px;
+            color: #cbd5e1;
+        }}
+        .vessel-dot {{
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }}
+        /* Status */
         .status {{
             position: absolute;
-            bottom: 10px;
+            bottom: 120px;
             left: 10px;
-            background: rgba(0,0,0,0.8);
+            background: rgba(0,0,0,0.85);
             color: white;
-            padding: 10px;
-            border-radius: 5px;
+            padding: 8px 12px;
+            border-radius: 6px;
             z-index: 1000;
+            font-size: 12px;
         }}
         .error {{
             background: #ffebee;
@@ -1091,189 +1275,225 @@ class LeafletVisualizer:
             margin: 20px;
             border-radius: 5px;
         }}
-        .metrics {{
-            margin-top: 15px;
-            padding-top: 15px;
-            border-top: 1px solid #ddd;
-        }}
-        .metrics h4 {{ margin-top: 0; color: #2c5aa0; }}
-        .metrics p {{ margin: 5px 0; font-size: 14px; }}
-        .vessel-controls {{
-            margin-top: 10px;
-            padding: 8px;
-            background: #f5f5f5;
-            border-radius: 5px;
-            font-size: 12px;
-        }}
-        .vessel-controls-header {{
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 5px;
-        }}
-        .toggle-btn {{
-            padding: 3px 8px;
-            margin: 2px;
-            border: 1px solid #ccc;
-            background: white;
-            border-radius: 3px;
-            cursor: pointer;
-            font-size: 11px;
-            transition: all 0.2s;
-        }}
-        .toggle-btn.active {{
-            background: #4CAF50;
-            color: white;
-            border-color: #4CAF50;
-        }}
-        .toggle-btn:hover {{
-            background: #e0e0e0;
-        }}
-        .toggle-btn.active:hover {{
-            background: #45a049;
-        }}
-        .timeline-controls .toggle-btn {{
-            padding: 8px 16px;
-            font-size: 13px;
-            font-weight: bold;
-        }}
+        /* Timeline controls bar */
         .timeline-controls {{
-            position: fixed;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            background: rgba(255, 255, 255, 0.98);
-            padding: 15px 20px;
-            box-shadow: 0 -2px 10px rgba(0,0,0,0.2);
+            height: 110px;
+            background: #1e293b;
+            border-top: 1px solid #334155;
+            padding: 8px 20px 6px;
+            display: {'flex' if total_timesteps > 0 else 'none'};
+            flex-direction: column;
+            gap: 6px;
             z-index: 1001;
         }}
         .control-row {{
             display: flex;
             align-items: center;
             justify-content: center;
-            gap: 10px;
-            margin-bottom: 8px;
+            gap: 8px;
         }}
         .nav-btn {{
-            padding: 8px 16px;
-            background: #2c5aa0;
+            padding: 6px 14px;
+            background: #2563eb;
             color: white;
             border: none;
-            border-radius: 5px;
+            border-radius: 6px;
             cursor: pointer;
-            font-size: 13px;
-            font-weight: bold;
-            transition: background 0.3s;
+            font-size: 12px;
+            font-weight: 600;
+            transition: background 0.2s;
+            letter-spacing: 0.02em;
         }}
-        .nav-btn:hover {{
-            background: #1e4070;
+        .nav-btn:hover {{ background: #1d4ed8; }}
+        .nav-btn:disabled {{ background: #334155; color: #64748b; cursor: not-allowed; }}
+        .play-btn {{
+            padding: 6px 18px;
+            background: #059669;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 700;
+            transition: background 0.2s;
         }}
-        .nav-btn:disabled {{
-            background: #ccc;
-            cursor: not-allowed;
-        }}
+        .play-btn:hover {{ background: #047857; }}
+        .play-btn.playing {{ background: #dc2626; }}
+        .play-btn.playing:hover {{ background: #b91c1c; }}
         .time-display {{
-            font-size: 16px;
-            font-weight: bold;
-            color: #2c5aa0;
-            min-width: 220px;
+            font-size: 14px;
+            font-weight: 700;
+            color: #f1f5f9;
+            min-width: 200px;
             text-align: center;
-            background: #f0f0f0;
-            padding: 8px 12px;
-            border-radius: 5px;
+            background: #0f172a;
+            padding: 6px 12px;
+            border-radius: 6px;
+            border: 1px solid #334155;
+            font-variant-numeric: tabular-nums;
         }}
         .time-slider {{
             flex: 1;
-            max-width: 600px;
-            height: 6px;
-            border-radius: 3px;
-            background: #ddd;
+            max-width: 700px;
+            height: 4px;
+            border-radius: 2px;
+            background: #334155;
             outline: none;
             cursor: pointer;
-        }}
-        .time-slider::-webkit-slider-thumb {{
-            appearance: none;
-            width: 18px;
-            height: 18px;
-            border-radius: 50%;
-            background: #2c5aa0;
-            cursor: pointer;
-        }}
-        .time-slider::-moz-range-thumb {{
-            width: 18px;
-            height: 18px;
-            border-radius: 50%;
-            background: #2c5aa0;
-            cursor: pointer;
-            border: none;
+            accent-color: #2563eb;
         }}
         .step-selector {{
-            padding: 6px 10px;
-            border-radius: 5px;
-            border: 2px solid #2c5aa0;
-            font-size: 13px;
+            padding: 5px 8px;
+            border-radius: 6px;
+            border: 1px solid #475569;
+            font-size: 12px;
             cursor: pointer;
-            background: white;
+            background: #0f172a;
+            color: #e2e8f0;
         }}
         .step-label {{
-            font-size: 13px;
-            font-weight: bold;
-            color: #555;
+            font-size: 11px;
+            font-weight: 600;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }}
+        .time-range-label {{
+            font-size: 11px;
+            color: #475569;
+        }}
+        /* Show/Hide toggle buttons */
+        .vis-toggle {{
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 12px;
+            border-radius: 20px;
+            border: 1.5px solid transparent;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            transition: all 0.2s;
+        }}
+        .vis-toggle .dot {{ width:9px; height:9px; border-radius:50%; }}
+        .vis-toggle-history {{
+            border-color: #3b82f6;
+            color: #93c5fd;
+            background: rgba(59,130,246,0.1);
+        }}
+        .vis-toggle-history.off {{
+            border-color: #334155; color: #475569; background: transparent;
+        }}
+        .vis-toggle-gt {{
+            border-color: #22c55e;
+            color: #86efac;
+            background: rgba(34,197,94,0.1);
+        }}
+        .vis-toggle-gt.off {{
+            border-color: #334155; color: #475569; background: transparent;
+        }}
+        .vis-toggle-pred {{
+            border-color: #f97316;
+            color: #fdba74;
+            background: rgba(249,115,22,0.1);
+        }}
+        .vis-toggle-pred.off {{
+            border-color: #334155; color: #475569; background: transparent;
+        }}
+        .vis-toggle-autofit {{
+            border-color: #a78bfa;
+            color: #c4b5fd;
+            background: rgba(167,139,250,0.1);
+        }}
+        .vis-toggle-autofit.off {{
+            border-color: #334155; color: #475569; background: transparent;
         }}
     </style>
 </head>
 <body>
-    <div id="map"></div>
+    <div class="main-layout">
+        <div id="map"></div>
 
-    <div class="info-panel">
-        <h3>AIS Scenario</h3>
-        <p><strong>Scenario:</strong> {scenario_id}</p>
-        <p><strong>Model:</strong> Wayformer-AIS</p>
-        <p><strong>Vessels:</strong> <span id="vessel-count">{len(all_vessel_ids)}</span></p>
-        <div class="legend" id="legend-container">
-            <h4>Vessels & Trajectories:</h4>
-            <!-- Vessel legend will be dynamically generated -->
+        <div class="sidebar">
+            <div class="sidebar-section">
+                <div class="sidebar-title">Scenario</div>
+                <div class="scenario-name">{scenario_id}</div>
+                <div class="model-badge">Wayformer-AIS</div>
+            </div>
+
+            <div class="sidebar-section">
+                <div class="sidebar-title">Trajectory Legend</div>
+                <div class="legend-row">
+                    <div class="legend-line" style="background:#3b82f6"></div>
+                    <span>History (past {past_len}s)</span>
+                </div>
+                <div class="legend-row">
+                    <div class="legend-dot" style="background:#3b82f6;width:14px;height:14px;border:3px solid white;flex-shrink:0"></div>
+                    <span>Current position (head)</span>
+                </div>
+                <div class="legend-row">
+                    <div class="legend-line-dash" style="border-color:#22c55e"></div>
+                    <span>Ground truth (next {future_len}s)</span>
+                </div>
+                <div class="legend-row">
+                    <div class="legend-line-dash" style="border-color:#f97316"></div>
+                    <span>Model prediction</span>
+                </div>
+            </div>
+
+            <div class="sidebar-section" id="vessel-list-section">
+                <div class="sidebar-title">Vessels (<span id="vessel-count">{len(all_vessel_ids)}</span>)</div>
+                <div id="vessel-list">
+                    <!-- filled by JS -->
+                </div>
+            </div>
+
+            <div class="sidebar-section">
+                {metrics_html}
+            </div>
+
+            <div class="sidebar-section" style="font-size:11px; color:#475569; line-height:1.6;">
+                Click trajectories for details<br>
+                Scroll to zoom · Drag to pan
+            </div>
         </div>
-        {metrics_html}
-        <p><small>Click trajectories for details</small></p>
-        <p><small>Zoom and pan to explore</small></p>
-        <p><small>Predicted vessel shown with thicker line</small></p>
     </div>
 
-    <div class="status" id="status">
-        Loading scenario map...
-    </div>
+    <div class="status" id="status">Loading scenario map…</div>
 
-    <div class="timeline-controls" id="timeline-controls" style="display: {'block' if total_timesteps > 0 else 'none'};">
+    <div class="timeline-controls" id="timeline-controls">
         <div class="control-row">
-            <button class="nav-btn" id="btn-first" onclick="goToFirst()">First</button>
-            <button class="nav-btn" id="btn-prev" onclick="previousFrame()">Prev</button>
+            <button class="nav-btn" id="btn-first" onclick="goToFirst()">⏮ First</button>
+            <button class="nav-btn" id="btn-prev" onclick="previousFrame()">◀ Prev</button>
             <div class="time-display" id="time-display">T = {window_start_idx}s</div>
-            <button class="nav-btn" id="btn-next" onclick="nextFrame()">Next</button>
-            <button class="nav-btn" id="btn-last" onclick="goToLast()">Last</button>
-            <button class="nav-btn" id="btn-play" onclick="togglePlay()">Play</button>
+            <button class="nav-btn" id="btn-next" onclick="nextFrame()">Next ▶</button>
+            <button class="nav-btn" id="btn-last" onclick="goToLast()">Last ⏭</button>
+            <button class="play-btn" id="btn-play" onclick="togglePlay()">▶ Play</button>
         </div>
         <div class="control-row">
-            <span class="step-label">Step:</span>
+            <span class="step-label">Step</span>
             <select class="step-selector" id="step-selector" onchange="updateStepSize()">
-                <option value="1">1s</option>
-                <option value="5">5s</option>
-                <option value="10" selected>10s</option>
-                <option value="30">30s</option>
-                <option value="60">1min</option>
-                <option value="300">5min</option>
-                <option value="600">10min</option>
+                {_step_options_html}
             </select>
             <input type="range" class="time-slider" id="time-slider"
                    min="0" max="{max(0, total_timesteps - past_len - future_len) if total_timesteps > 0 else 100}"
                    value="{window_start_idx}" oninput="onSliderChange(this.value)">
-            <span class="step-label" id="time-range-label">0 - {total_timesteps if total_timesteps > 0 else 0}s</span>
+            <span class="time-range-label" id="time-range-label">0 – {total_timesteps if total_timesteps > 0 else 0}s</span>
         </div>
         <div class="control-row">
-            <span class="step-label">Show/Hide:</span>
-            <button class="toggle-btn active" id="btn-toggle-history" onclick="toggleAllHistory()">History</button>
-            <button class="toggle-btn active" id="btn-toggle-gt" onclick="toggleAllGT()">Future GT</button>
-            <button class="toggle-btn active" id="btn-toggle-pred" onclick="toggleAllPredictions()">Predictions</button>
+            <button class="vis-toggle vis-toggle-history" id="btn-toggle-history" onclick="toggleAllHistory()">
+                <span class="dot" style="background:#3b82f6"></span> History
+            </button>
+            <button class="vis-toggle vis-toggle-gt" id="btn-toggle-gt" onclick="toggleAllGT()">
+                <span class="dot" style="background:#22c55e"></span> GT Future
+            </button>
+            <button class="vis-toggle vis-toggle-pred" id="btn-toggle-pred" onclick="toggleAllPredictions()">
+                <span class="dot" style="background:#f97316"></span> Prediction
+            </button>
+            <button class="vis-toggle vis-toggle-autofit off" id="btn-autofit" onclick="toggleAutoFit()">
+                <span class="dot" style="background:#a78bfa"></span> Auto-Fit
+            </button>
         </div>
     </div>
 
@@ -1301,10 +1521,15 @@ class LeafletVisualizer:
 
         // Timeline state
         let currentTime = initialWindowStart;
-        let stepSize = 10;
+        let stepSize = {_default_step};
         let isPlaying = false;
         let playInterval = null;
         const maxCurrentTime = Math.max(0, totalTimesteps - pastLen - futureLen);
+
+        // Prediction fan data (multi-window, blue→red gradient)
+        const predFanData = {json.dumps(pred_fan_data)};
+        let showPredFan = true;
+        let predFanLayers = [];
 
         // Toggle states - track which trajectory types are visible
         let showHistory = true;
@@ -1313,6 +1538,10 @@ class LeafletVisualizer:
 
         // Zoom preservation: only auto-fit bounds on the first render
         let initialFitDone = false;
+
+        // Auto-fit toggle: when ON, every frame re-fits bounds to all vessels
+        let autoFit = false;
+        let _fitBoundsInProgress = false;  // suppress user-zoom detection during programmatic fit
 
         // Leaflet map and layers
         let map = null;
@@ -1340,12 +1569,21 @@ class LeafletVisualizer:
                 // Initialize map - will auto-zoom to fit bounds tightly
                 map = L.map('map').setView([{center_lat}, {center_lon}], 18);
 
-                // Add OpenStreetMap tiles with MUCH higher zoom for detailed trajectory analysis
-                L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-                    attribution: '© OpenStreetMap contributors',
-                    maxZoom: 25,  // Allow extreme zoom for meter-level precision
-                    maxNativeZoom: 19  // OSM native max (will upscale beyond this)
+                // CartoDB Voyager — normal street map, works from file:// URLs, no Referer required
+                L.tileLayer('https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+                    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/">CARTO</a>',
+                    maxZoom: 25,
+                    maxNativeZoom: 19
                 }}).addTo(map);
+
+                // Disable auto-fit when user manually zooms (scroll wheel or pinch)
+                map.on('zoomstart', function() {{
+                    if (!_fitBoundsInProgress && autoFit) {{
+                        autoFit = false;
+                        const btn = document.getElementById('btn-autofit');
+                        if (btn) btn.classList.add('off');
+                    }}
+                }});
 
                 // Initialize vessel layer groups
                 vesselIds.forEach(function(vesselId) {{
@@ -1365,6 +1603,26 @@ class LeafletVisualizer:
                     renderStaticSnapshot();
                 }}
 
+                // Populate vessel list in sidebar
+                (function() {{
+                    const list = document.getElementById('vessel-list');
+                    if (!list) return;
+                    list.innerHTML = '';
+                    vesselIds.forEach(function(vesselId, i) {{
+                        const color = vesselColors[i] || '#64748b';
+                        const isPred = (vesselId === predictedVesselIdx);
+                        const row = document.createElement('div');
+                        row.className = 'vessel-row';
+                        row.innerHTML =
+                            '<div class="vessel-dot" style="background:' + color +
+                            ';border:2px solid rgba(255,255,255,0.3)"></div>' +
+                            '<span>Vessel ' + vesselId +
+                            (isPred ? ' <span style="color:#f97316;font-size:10px;font-weight:700">(target)</span>' : '') +
+                            '</span>';
+                        list.appendChild(row);
+                    }});
+                }})();
+
                 console.log('Scenario map initialized');
 
             }} catch (error) {{
@@ -1375,6 +1633,19 @@ class LeafletVisualizer:
         }}
 
         // ============= INTERACTIVE TIMELINE FUNCTIONS =============
+
+        // Return the latest prediction window that has started (time_offset <= t).
+        // Falls back to the first window if t is before all windows.
+        function getClosestPrediction(t) {{
+            if (!predFanData || predFanData.length === 0) return null;
+            let best = predFanData[0];
+            for (let i = 0; i < predFanData.length; i++) {{
+                if (predFanData[i].time_offset <= t) {{
+                    best = predFanData[i];
+                }}
+            }}
+            return best;
+        }}
 
         function initInteractiveTimeline() {{
             // Initial render
@@ -1387,12 +1658,8 @@ class LeafletVisualizer:
         }}
 
         function updateVisualization() {{
-            console.log('Rendering frame at t=' + currentTime + 's');
-
-            // Clear existing layers
             clearLayers();
 
-            // Calculate time windows
             const pastStart = Math.max(0, currentTime);
             const pastEnd = Math.min(currentTime + pastLen, totalTimesteps);
             const futureStart = pastEnd;
@@ -1400,180 +1667,124 @@ class LeafletVisualizer:
 
             const allLayers = [];
 
-            // Render each vessel
             vesselIds.forEach(function(vesselId, idx) {{
                 if (!timelineData[idx]) return;
 
                 const vessel = timelineData[idx];
-                const vesselColor = vesselColors[idx];
                 const isPredicted = (vesselId === predictedVesselIdx);
+                const vColor = vesselColors[idx] || '#94a3b8';
 
-                // 1. PAST TRAJECTORY (solid line)
+                // Semantic colors: predicted vessel uses design colors; others use muted vessel color
+                const histColor  = isPredicted ? '#3b82f6' : vColor;
+                const histWeight = isPredicted ? 5 : 3;
+                const histOpacity = isPredicted ? 0.85 : 0.45;
+                const gtColor    = isPredicted ? '#22c55e' : vColor;
+                const gtOpacity  = isPredicted ? 0.85 : 0.4;
+
+                // 1. HISTORY LINE (solid)
                 const pastCoords = vessel.positions.slice(pastStart, pastEnd);
                 if (pastCoords.length > 1) {{
                     const pastLine = L.polyline(pastCoords, {{
-                        color: vesselColor,
-                        weight: isPredicted ? 8 : 5,
-                        opacity: 1.0,
-                        dashArray: ''
+                        color: histColor, weight: histWeight, opacity: histOpacity, dashArray: ''
                     }});
-
                     pastLine.bindPopup(
-                        '<b>' + (isPredicted ? 'Predicted ' : '') + 'Vessel ' + vesselId + ' - Past</b><br>' +
-                        'Time: t=' + pastStart + 's to t=' + (pastEnd-1) + 's<br>' +
-                        'Duration: ' + (pastEnd - pastStart) + 's'
+                        '<b>' + (isPredicted ? 'Target' : 'Context') + ' Vessel ' + vesselId + ' — History</b><br>' +
+                        't=' + pastStart + 's → t=' + (pastEnd-1) + 's (' + (pastEnd-pastStart) + 's)'
                     );
-
-                    // Only add to map if history is enabled
-                    if (showHistory) {{
-                        pastLine.addTo(map);
-                    }}
-
+                    if (showHistory) pastLine.addTo(map);
                     vesselLayers[vesselId].past.push(pastLine);
                     allLayers.push(pastLine);
 
-                    // Add position markers
-                    pastCoords.forEach(function(coord, i) {{
-                        const t = pastStart + i;
-                        const speed = vessel.speeds[t] || 0;
-                        const marker = L.circleMarker(coord, {{
-                            radius: isPredicted ? 6 : 4,
-                            fillColor: vesselColor,
-                            color: '#fff',
-                            weight: 2,
-                            opacity: 1,
-                            fillOpacity: 0.9
-                        }});
-
-                        marker.bindPopup(
-                            '<b>Vessel ' + vesselId + '</b><br>' +
-                            'Time: t=' + t + 's<br>' +
-                            'Lat: ' + coord[0].toFixed(6) + '<br>' +
-                            'Lon: ' + coord[1].toFixed(6) + '<br>' +
-                            'Speed: ' + speed.toFixed(2) + ' knots'
-                        );
-
-                        // Only add to map if history is enabled
-                        if (showHistory) {{
-                            marker.addTo(map);
-                        }}
-
-                        vesselLayers[vesselId].past.push(marker);
+                    // HEAD MARKER at current position (last observed point)
+                    const headCoord = pastCoords[pastCoords.length - 1];
+                    const headRadius = isPredicted ? 8 : 5;
+                    const speed = vessel.speeds[pastEnd - 1] || 0;
+                    const head = L.circleMarker(headCoord, {{
+                        radius: headRadius, fillColor: histColor,
+                        color: '#ffffff', weight: isPredicted ? 2.5 : 1.5,
+                        opacity: 1, fillOpacity: 1
                     }});
+                    head.bindPopup(
+                        '<b>' + (isPredicted ? 'Target' : 'Context') + ' Vessel ' + vesselId + ' — Now</b><br>' +
+                        't=' + (pastEnd-1) + 's<br>' +
+                        'Lat: ' + headCoord[0].toFixed(6) + '<br>' +
+                        'Lon: ' + headCoord[1].toFixed(6) + '<br>' +
+                        'Speed: ' + speed.toFixed(1) + ' kts'
+                    );
+                    if (showHistory) head.addTo(map);
+                    vesselLayers[vesselId].past.push(head);
                 }}
 
-                // 2. FUTURE TRAJECTORY (dashed line - ground truth)
+                // 2. GROUND TRUTH FUTURE (dashed green)
                 const futureCoords = vessel.positions.slice(futureStart, futureEnd);
                 if (futureCoords.length > 1) {{
                     const futureLine = L.polyline(futureCoords, {{
-                        color: vesselColor,
-                        weight: isPredicted ? 8 : 5,
-                        opacity: 0.7,
-                        dashArray: '10, 5'
+                        color: gtColor, weight: isPredicted ? 4 : 2.5,
+                        opacity: gtOpacity, dashArray: '10, 5'
                     }});
-
                     futureLine.bindPopup(
-                        '<b>' + (isPredicted ? 'Predicted ' : '') + 'Vessel ' + vesselId + ' - Future GT</b><br>' +
-                        'Time: t=' + futureStart + 's to t=' + (futureEnd-1) + 's<br>' +
-                        'Duration: ' + (futureEnd - futureStart) + 's'
+                        '<b>' + (isPredicted ? 'Target' : 'Context') + ' Vessel ' + vesselId + ' — GT Future</b><br>' +
+                        't=' + futureStart + 's → t=' + (futureEnd-1) + 's'
                     );
-
-                    // Only add to map if Future GT is enabled
-                    if (showFutureGT) {{
-                        futureLine.addTo(map);
-                    }}
-
+                    if (showFutureGT) futureLine.addTo(map);
                     vesselLayers[vesselId].future.push(futureLine);
                     allLayers.push(futureLine);
 
-                    // Add position markers
-                    futureCoords.forEach(function(coord, i) {{
-                        const t = futureStart + i;
-                        const speed = vessel.speeds[t] || 0;
-                        const marker = L.circleMarker(coord, {{
-                            radius: isPredicted ? 5 : 3,
-                            fillColor: vesselColor,
-                            color: '#fff',
-                            weight: 1,
-                            opacity: 1,
-                            fillOpacity: 0.7
+                    // Endpoint marker for predicted vessel only
+                    if (isPredicted) {{
+                        const gtEnd = futureCoords[futureCoords.length - 1];
+                        const gtEndMark = L.circleMarker(gtEnd, {{
+                            radius: 5, fillColor: '#22c55e',
+                            color: '#ffffff', weight: 2, opacity: 1, fillOpacity: 0.9
                         }});
-
-                        marker.bindPopup(
-                            '<b>Vessel ' + vesselId + ' (Future GT)</b><br>' +
-                            'Time: t=' + t + 's<br>' +
-                            'Lat: ' + coord[0].toFixed(6) + '<br>' +
-                            'Lon: ' + coord[1].toFixed(6) + '<br>' +
-                            'Speed: ' + speed.toFixed(2) + ' knots'
-                        );
-
-                        // Only add to map if Future GT is enabled
-                        if (showFutureGT) {{
-                            marker.addTo(map);
-                        }}
-
-                        vesselLayers[vesselId].future.push(marker);
-                    }});
+                        gtEndMark.bindPopup('<b>GT endpoint</b> t=' + (futureEnd-1) + 's');
+                        if (showFutureGT) gtEndMark.addTo(map);
+                        vesselLayers[vesselId].future.push(gtEndMark);
+                    }}
                 }}
 
-                // 3. PREDICTION TRAJECTORY (dotted line - only for predicted vessel)
-                if (isPredicted && predictionCoords.length > 0) {{
-                    const predLine = L.polyline(predictionCoords, {{
-                        color: vesselColor,
-                        weight: 8,
-                        opacity: 0.9,
-                        dashArray: '2, 5'
-                    }});
-
-                    predLine.bindPopup(
-                        '<b>Model Prediction</b><br>' +
-                        'From time: t=' + currentTime + 's<br>' +
-                        'Prediction length: ' + predictionCoords.length + ' points'
-                    );
-
-                    // Only add to map if predictions are enabled
-                    if (showPredictions) {{
-                        predLine.addTo(map);
-                    }}
-
-                    vesselLayers[vesselId].prediction.push(predLine);
-                    allLayers.push(predLine);
-
-                    // Add prediction markers
-                    predictionCoords.forEach(function(coord, i) {{
-                        const marker = L.circleMarker(coord, {{
-                            radius: 5,
-                            fillColor: vesselColor,
-                            color: '#000',
-                            weight: 2,
-                            opacity: 1,
-                            fillOpacity: 0.9
+                // 3. LIVE PREDICTION (dashed orange, predicted vessel only)
+                if (isPredicted) {{
+                    const predEntry = getClosestPrediction(currentTime);
+                    const livePredCoords = predEntry ? predEntry.coords : [];
+                    if (livePredCoords.length > 1) {{
+                        const predLine = L.polyline(livePredCoords, {{
+                            color: '#f97316', weight: 4, opacity: 0.9, dashArray: '6, 6'
                         }});
-
-                        marker.bindPopup(
-                            '<b>Prediction t+' + (i+1) + '</b><br>' +
-                            'Lat: ' + coord[0].toFixed(6) + '<br>' +
-                            'Lon: ' + coord[1].toFixed(6)
+                        predLine.bindPopup(
+                            '<b>Model Prediction</b><br>' +
+                            'Window: t=' + (predEntry ? predEntry.time_offset : currentTime) + 's<br>' +
+                            'Horizon: ' + livePredCoords.length + 's'
                         );
+                        if (showPredictions) predLine.addTo(map);
+                        vesselLayers[vesselId].prediction.push(predLine);
+                        allLayers.push(predLine);
 
-                        // Only add to map if predictions are enabled
-                        if (showPredictions) {{
-                            marker.addTo(map);
-                        }}
-
-                        vesselLayers[vesselId].prediction.push(marker);
-                    }});
+                        // Endpoint marker
+                        const predEnd = livePredCoords[livePredCoords.length - 1];
+                        const predEndMark = L.circleMarker(predEnd, {{
+                            radius: 5, fillColor: '#f97316',
+                            color: '#ffffff', weight: 2, opacity: 1, fillOpacity: 0.85
+                        }});
+                        predEndMark.bindPopup('<b>Prediction endpoint</b> +' + livePredCoords.length + 's');
+                        if (showPredictions) predEndMark.addTo(map);
+                        vesselLayers[vesselId].prediction.push(predEndMark);
+                    }}
                 }}
             }});
 
-            // Fit map bounds only on first render; preserve user zoom after that
+            // Initial fit on first render (always), then respect autoFit toggle
             if (allLayers.length > 0 && !initialFitDone) {{
-                const group = new L.featureGroup(allLayers);
-                map.fitBounds(group.getBounds().pad(0.1));
+                _fitBoundsInProgress = true;
+                map.fitBounds(new L.featureGroup(allLayers).getBounds().pad(0.1));
+                setTimeout(function() {{ _fitBoundsInProgress = false; }}, 600);
                 initialFitDone = true;
+            }} else if (autoFit && allLayers.length > 0) {{
+                _fitBoundsInProgress = true;
+                map.fitBounds(new L.featureGroup(allLayers).getBounds().pad(0.05));
+                setTimeout(function() {{ _fitBoundsInProgress = false; }}, 600);
             }}
 
-            // Update time display
             updateTimeDisplay();
         }}
 
@@ -1651,9 +1862,9 @@ class LeafletVisualizer:
         function togglePlay() {{
             isPlaying = !isPlaying;
             const btn = document.getElementById('btn-play');
-
             if (isPlaying) {{
-                btn.innerHTML = 'Pause';
+                btn.innerHTML = '⏸ Pause';
+                btn.classList.add('playing');
                 playInterval = setInterval(function() {{
                     if (currentTime >= maxCurrentTime) {{
                         togglePlay();
@@ -1662,7 +1873,8 @@ class LeafletVisualizer:
                     }}
                 }}, 500);
             }} else {{
-                btn.innerHTML = 'Play';
+                btn.innerHTML = '▶ Play';
+                btn.classList.remove('playing');
                 if (playInterval) {{
                     clearInterval(playInterval);
                     playInterval = null;
@@ -1670,68 +1882,57 @@ class LeafletVisualizer:
             }}
         }}
 
-        // Global toggle functions for all vessels
+        // Global toggle functions — buttons start ON (no .off class); clicking adds .off to dim them
         function toggleAllHistory() {{
             const btn = document.getElementById('btn-toggle-history');
-            const isActive = btn.classList.contains('active');
-
+            const willBeOff = !btn.classList.contains('off');
             vesselIds.forEach(function(vesselId) {{
                 if (vesselLayers[vesselId] && vesselLayers[vesselId].past) {{
                     vesselLayers[vesselId].past.forEach(function(layer) {{
-                        if (isActive) {{
-                            map.removeLayer(layer);
-                        }} else {{
-                            map.addLayer(layer);
-                        }}
+                        if (willBeOff) map.removeLayer(layer); else layer.addTo(map);
                     }});
                 }}
             }});
-
-            btn.classList.toggle('active');
-            showHistory = !isActive;  // Update state
-            console.log('History toggled:', showHistory ? 'visible' : 'hidden');
+            btn.classList.toggle('off');
+            showHistory = !willBeOff;
         }}
 
         function toggleAllGT() {{
             const btn = document.getElementById('btn-toggle-gt');
-            const isActive = btn.classList.contains('active');
-
+            const willBeOff = !btn.classList.contains('off');
             vesselIds.forEach(function(vesselId) {{
                 if (vesselLayers[vesselId] && vesselLayers[vesselId].future) {{
                     vesselLayers[vesselId].future.forEach(function(layer) {{
-                        if (isActive) {{
-                            map.removeLayer(layer);
-                        }} else {{
-                            map.addLayer(layer);
-                        }}
+                        if (willBeOff) map.removeLayer(layer); else layer.addTo(map);
                     }});
                 }}
             }});
-
-            btn.classList.toggle('active');
-            showFutureGT = !isActive;  // Update state
-            console.log('Future GT toggled:', showFutureGT ? 'visible' : 'hidden');
+            btn.classList.toggle('off');
+            showFutureGT = !willBeOff;
         }}
 
         function toggleAllPredictions() {{
             const btn = document.getElementById('btn-toggle-pred');
-            const isActive = btn.classList.contains('active');
-
+            const willBeOff = !btn.classList.contains('off');
             vesselIds.forEach(function(vesselId) {{
                 if (vesselLayers[vesselId] && vesselLayers[vesselId].prediction) {{
                     vesselLayers[vesselId].prediction.forEach(function(layer) {{
-                        if (isActive) {{
-                            map.removeLayer(layer);
-                        }} else {{
-                            map.addLayer(layer);
-                        }}
+                        if (willBeOff) map.removeLayer(layer); else layer.addTo(map);
                     }});
                 }}
             }});
+            btn.classList.toggle('off');
+            showPredictions = !willBeOff;
+        }}
 
-            btn.classList.toggle('active');
-            showPredictions = !isActive;  // Update state
-            console.log('Predictions toggled:', showPredictions ? 'visible' : 'hidden');
+        function toggleAutoFit() {{
+            const btn = document.getElementById('btn-autofit');
+            autoFit = btn.classList.contains('off');  // was off → now turning on
+            btn.classList.toggle('off');
+            if (autoFit) {{
+                // Immediately apply fit
+                updateVisualization();
+            }}
         }}
 
         // Keyboard shortcuts
@@ -1937,8 +2138,13 @@ class LeafletVisualizer:
                 legendHTML += '<div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #ddd;">' +
                               '<div class="legend-item"><span style="border-bottom: 3px solid #333;">History (Observed)</span></div>' +
                               '<div class="legend-item"><span style="border-bottom: 3px dashed #333;">Future GT (Actual)</span></div>' +
-                              '<div class="legend-item"><span style="border-bottom: 3px dotted #333;">Prediction (Model)</span></div>' +
-                              '</div>';
+                              '<div class="legend-item"><span style="border-bottom: 3px dotted #333;">Prediction (Model)</span></div>';
+                if (predFanData.length > 0) {{
+                    legendHTML += '<div class="legend-item" style="margin-top:6px;">' +
+                                  '<span style="background: linear-gradient(to right, #0000ff, #00ff00, #ff0000); width:40px; height:4px; display:inline-block; margin-right:8px; border-radius:2px;"></span>' +
+                                  '<span>Pred Fan (early→late)</span></div>';
+                }}
+                legendHTML += '</div>';
 
                 legendContainer.innerHTML = legendHTML;
 
@@ -1998,6 +2204,68 @@ class LeafletVisualizer:
                 }}, 3000);
 
                 console.log('Scenario map initialized with ' + vesselIds.length + ' vessels');
+        }}
+
+        // ============= PREDICTION FAN (multi-window, blue→red) =============
+
+        function renderPredFan() {{
+            // Remove existing fan layers
+            predFanLayers.forEach(function(l) {{ map.removeLayer(l); }});
+            predFanLayers = [];
+            if (!showPredFan || predFanData.length === 0) return;
+
+            predFanData.forEach(function(win) {{
+                if (!win.coords || win.coords.length === 0) return;
+                const label = 'Prediction at t=' + win.time_offset + 's';
+
+                // Draw thin connecting line between dots
+                if (win.coords.length >= 2) {{
+                    const line = L.polyline(win.coords, {{
+                        color: win.color,
+                        weight: 1.0,
+                        opacity: 0.4,
+                    }});
+                    line.addTo(map);
+                    predFanLayers.push(line);
+                }}
+
+                // Anchor dot: vessel position at start of this prediction window
+                if (win.anchor) {{
+                    const anchor = L.circleMarker(win.anchor, {{
+                        radius: 4,
+                        color: win.color,
+                        fillColor: win.color,
+                        fillOpacity: 0.9,
+                        weight: 1,
+                    }});
+                    anchor.bindTooltip(label + ' (start)', {{sticky: true}});
+                    anchor.addTo(map);
+                    predFanLayers.push(anchor);
+                }}
+
+                // Prediction dots: one per future timestep
+                win.coords.forEach(function(coord, idx) {{
+                    // Show every 5th dot to avoid clutter (60 steps → 12 dots)
+                    if (idx % 5 !== 4) return;
+                    const dot = L.circleMarker(coord, {{
+                        radius: 3,
+                        color: win.color,
+                        fillColor: win.color,
+                        fillOpacity: 0.75,
+                        weight: 0,
+                    }});
+                    dot.bindTooltip(label + ' +' + (idx + 1) + 's', {{sticky: true}});
+                    dot.addTo(map);
+                    predFanLayers.push(dot);
+                }});
+            }});
+        }}
+
+        function togglePredFan() {{
+            showPredFan = !showPredFan;
+            renderPredFan();
+            const btn = document.getElementById('btn-toggle-fan');
+            if (btn) btn.classList.toggle('active', showPredFan);
         }}
 
         window.addEventListener('error', function(e) {{
@@ -2132,8 +2400,9 @@ class LeafletVisualizer:
     <script>
         var map = L.map('map').setView([{center_lat}, {center_lon}], 10);
 
-        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-            attribution: '&copy; OpenStreetMap contributors'
+        L.tileLayer('https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/">CARTO</a>',
+            maxZoom: 20
         }}).addTo(map);
 
         var allLayers = [];

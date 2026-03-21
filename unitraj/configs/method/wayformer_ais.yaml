@@ -31,7 +31,7 @@ scheduler: multistep
 ewc_lambda: 2000
 grad_clip_norm: 10  # Higher clip for stability
 train_batch_size: 8   # Larger batch size (2459 samples / 8 = ~307 batches per epoch)
-eval_batch_size: 8    # Match train batch size
+eval_batch_size: 96   # Dense eval: ~3.8GB est. peak (safe on 6GB GPU)
 
 # data related - Marine environment settings
 max_num_agents: 10        # Match dataloader config (reduced from 16)

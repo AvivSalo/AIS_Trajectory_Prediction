@@ -1,0 +1,36 @@
+# exp setting
+exp_name: 'wayformer_5min_future_fulldata'
+ckpt_path: null
+seed: 42
+debug: False
+devices: [ 0 ]
+normalize_data: True
+
+# data related
+load_num_workers: 6
+train_data_path: [ "/home/ubuntu/projects/AIS_Trajectory_Prediction/unitraj/data/processed_ais_4hours_optimized/train" ]
+val_data_path: [ "/home/ubuntu/projects/AIS_Trajectory_Prediction/unitraj/data/processed_ais_4hours_optimized/val" ]
+cache_path: "./cache_5min"
+max_data_num: [ 100 ]
+starting_frame: [ 0 ]
+past_len: 300  # 300 seconds (5 minutes) history
+future_len: 300                # 5 min prediction @ 1Hz
+stride: 300                    # non-overlapping windows
+object_type: [ 'VESSEL' ]
+line_type: [ ]
+masked_attributes: [ 'z_axis', 'size' ]
+trajectory_sample_interval: 1
+only_train_on_ego: False
+center_offset_of_map: [ 0.0, 0.0 ]
+use_cache: True
+overwrite_cache: True
+store_data_in_memory: False
+
+# official evaluation (not applicable for AIS data)
+nuscenes_dataroot: ''
+eval_nuscenes: False
+eval_waymo: False
+eval_argoverse2: False
+
+defaults:
+  - method: wayformer_ais
