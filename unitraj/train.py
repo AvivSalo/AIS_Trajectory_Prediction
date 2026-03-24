@@ -52,7 +52,7 @@ def train(cfg):
         max_epochs=cfg.method.max_epochs,
         logger=None if cfg.debug else WandbLogger(project="unitraj", name=cfg.exp_name, id=cfg.exp_name,
                                                    config=OmegaConf.to_container(cfg, resolve=True),
-                                                   settings=wandb.Settings(init_timeout=300)),
+                                                   settings=wandb.Settings(init_timeout=300, _service_wait=300)),
         devices=1 if cfg.debug else cfg.devices,
         gradient_clip_val=cfg.method.grad_clip_norm,
         accelerator="cpu" if cfg.debug else "gpu",
