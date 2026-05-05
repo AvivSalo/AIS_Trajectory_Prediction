@@ -36,6 +36,10 @@ class EvaluationCallback(pl.Callback):
         self.config = config
         self._eval_start_time = None
         self._batch_count = 0
+        # Linear baseline — lazily instantiated on the first batch, skipped when the
+        # evaluated model itself is the baseline.
+        self._baseline_model = None
+        self._baseline_metrics = []      # [{time_offset, min_ade_m, min_fde_m}]
         os.makedirs(self.output_dir, exist_ok=True)
 
     def on_validation_epoch_start(self, trainer, pl_module):
@@ -80,6 +84,26 @@ class EvaluationCallback(pl.Callback):
                 scenario_ids = [str(scenario_ids)]
             scenario_ids = [str(sid) for sid in scenario_ids]
 
+            # --- Baseline comparison (skip when the evaluated model IS the baseline) ---
+            _model_name = str(getattr(pl_module.config, 'model_name', ''))
+            bl_min_ade_m = bl_min_fde_m = None
+            if _model_name != 'baseline_linear':
+                try:
+                    if self._baseline_model is None:
+                        from unitraj.models.baseline_linear.baseline_linear import BaselineLinear
+                        self._baseline_model = BaselineLinear(config=pl_module.config)
+                        self._baseline_model.eval()
+                        self._baseline_model = self._baseline_model.to(pred_trajs.device)
+                    with torch.no_grad():
+                        bl_pred, _ = self._baseline_model(batch)
+                    bl_xy = bl_pred['predicted_trajectory'][:, :, :, :2]  # [B, C, T, 2]
+                    bl_ade = torch.norm(bl_xy - gt_xy, dim=-1).mean(dim=-1)
+                    bl_fde = torch.norm(bl_xy[:, :, -1, :] - gt_xy[:, :, -1, :], dim=-1)
+                    bl_min_ade_m = (bl_ade.min(1).values * position_scale).cpu().numpy()
+                    bl_min_fde_m = (bl_fde.min(1).values * position_scale).cpu().numpy()
+                except Exception as e:
+                    logger.debug(f"Baseline comparison skipped: {e}")
+
             for i in range(batch_size):
                 scenario_id = scenario_ids[i]
 
@@ -110,6 +134,13 @@ class EvaluationCallback(pl.Callback):
                     'miss_10m': bool(min_fde_m[i] > 10.0),
                     'miss_20m': bool(min_fde_m[i] > 20.0),
                 })
+
+                if bl_min_ade_m is not None:
+                    self._baseline_metrics.append({
+                        'time_offset': time_offset,
+                        'min_ade_m': float(bl_min_ade_m[i]),
+                        'min_fde_m': float(bl_min_fde_m[i]),
+                    })
 
                 # Store first window's data for visualization (GT + scene context)
                 if vessel_id not in self.vessel_first_gt:
@@ -282,6 +313,37 @@ class EvaluationCallback(pl.Callback):
                 for k in range(len(hist_labels_list))
             ]
 
+            # --- Baseline aggregate (if available) ---
+            baseline_report = None
+            if self._baseline_metrics:
+                bl_ade_arr = np.array([m['min_ade_m'] for m in self._baseline_metrics])
+                bl_fde_arr = np.array([m['min_fde_m'] for m in self._baseline_metrics])
+                bl_per_bin = []
+                for j, (lo, hi) in enumerate(zip(bins, bins[1:])):
+                    mask = np.array([lo <= m['time_offset'] < hi for m in self._baseline_metrics])
+                    if mask.sum() > 0:
+                        bl_per_bin.append({
+                            'label':   bin_labels[j],
+                            'count':   int(mask.sum()),
+                            'ade':     float(bl_ade_arr[mask].mean()),
+                            'fde':     float(bl_fde_arr[mask].mean()),
+                            'miss':    float((bl_fde_arr[mask] > 2.0).mean()) * 100,
+                            'miss_5m': float((bl_fde_arr[mask] > 5.0).mean()) * 100,
+                            'miss_10m':float((bl_fde_arr[mask] > 10.0).mean()) * 100,
+                            'miss_20m':float((bl_fde_arr[mask] > 20.0).mean()) * 100,
+                        })
+                baseline_report = {
+                    'mean_ade':  round(float(bl_ade_arr.mean()), 3),
+                    'mean_fde':  round(float(bl_fde_arr.mean()), 3),
+                    'p90_ade':   round(float(np.percentile(bl_ade_arr, 90)), 3),
+                    'p90_fde':   round(float(np.percentile(bl_fde_arr, 90)), 3),
+                    'miss_2m':   round(float((bl_fde_arr > 2.0).mean()) * 100, 1),
+                    'miss_5m':   round(float((bl_fde_arr > 5.0).mean()) * 100, 1),
+                    'miss_10m':  round(float((bl_fde_arr > 10.0).mean()) * 100, 1),
+                    'miss_20m':  round(float((bl_fde_arr > 20.0).mean()) * 100, 1),
+                    'per_bin':   bl_per_bin,
+                }
+
             # --- Generate aggregate report ---
             cfg = self.config
             report_data = {
@@ -323,6 +385,7 @@ class EvaluationCallback(pl.Callback):
                 'cdf_y':        cdf_y,
                 'hist_labels':  hist_labels_list,
                 'hist_counts':  hist_counts_list,
+                'baseline':     baseline_report,
             }
 
             report_path = create_report(
@@ -344,6 +407,7 @@ class EvaluationCallback(pl.Callback):
             self.all_sample_metrics = []
             self.vessel_first_gt = {}
             self.vessel_first_scene_ctx = {}
+            self._baseline_metrics = []
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")

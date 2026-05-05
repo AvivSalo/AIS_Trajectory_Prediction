@@ -33,6 +33,7 @@ def create_report(report_data: dict, output_dir: str) -> str:
     str  - absolute path to the generated report HTML.
     """
     rd = report_data
+    baseline = rd.get('baseline')  # None when model IS the baseline or run failed
 
     # ── Pre-serialise chart data as JSON ────────────────────────────────────
     per_bin = rd.get('per_bin', [])
@@ -86,6 +87,199 @@ def create_report(report_data: dict, output_dir: str) -> str:
           <td class="num" style="color:{miss_color}">{v['miss']:.1f}%</td>
           <td>{link}</td>
         </tr>"""
+
+    # ── Baseline comparison section (only rendered when data is available) ──
+    if baseline:
+        bl = baseline
+
+        def _imp(model_val, baseline_val, lower_is_better=True):
+            """Return (value, css_color) for the improvement cell."""
+            if baseline_val == 0:
+                return '—', '#64748b'
+            pct = (baseline_val - model_val) / baseline_val * 100
+            if lower_is_better:
+                color = '#22c55e' if pct > 0 else '#ef4444'
+                sign = '▼' if pct > 0 else '▲'
+            else:
+                color = '#22c55e' if pct > 0 else '#ef4444'
+                sign = '▲' if pct > 0 else '▼'
+            return f'{sign} {abs(pct):.1f}%', color
+
+        def _imp_pp(model_val, baseline_val):
+            """Percentage-point improvement (for miss rates)."""
+            diff = baseline_val - model_val
+            color = '#22c55e' if diff > 0 else '#ef4444'
+            sign = '▼' if diff > 0 else '▲'
+            return f'{sign} {abs(diff):.1f} pp', color
+
+        rows = [
+            ('minADE6 (m)',    f"{rd['mean_ade']:.3f}",  f"{bl['mean_ade']:.3f}",  *_imp(rd['mean_ade'],  bl['mean_ade'])),
+            ('minFDE6 (m)',    f"{rd['mean_fde']:.3f}",  f"{bl['mean_fde']:.3f}",  *_imp(rd['mean_fde'],  bl['mean_fde'])),
+            ('p90 ADE (m)',    f"{rd['p90_ade']:.3f}",   f"{bl['p90_ade']:.3f}",   *_imp(rd['p90_ade'],   bl['p90_ade'])),
+            ('p90 FDE (m)',    f"{rd['p90_fde']:.3f}",   f"{bl['p90_fde']:.3f}",   *_imp(rd['p90_fde'],   bl['p90_fde'])),
+            ('Miss @ 2 m',     f"{rd['miss_2m']:.1f}%",  f"{bl['miss_2m']:.1f}%",  *_imp_pp(rd['miss_2m'],  bl['miss_2m'])),
+            ('Miss @ 5 m',     f"{rd['miss_5m']:.1f}%",  f"{bl['miss_5m']:.1f}%",  *_imp_pp(rd['miss_5m'],  bl['miss_5m'])),
+            ('Miss @ 10 m',    f"{rd['miss_10m']:.1f}%", f"{bl['miss_10m']:.1f}%", *_imp_pp(rd['miss_10m'], bl['miss_10m'])),
+            ('Miss @ 20 m',    f"{rd['miss_20m']:.1f}%", f"{bl['miss_20m']:.1f}%", *_imp_pp(rd['miss_20m'], bl['miss_20m'])),
+        ]
+
+        cmp_rows_html = ""
+        for metric, model_v, bl_v, imp_v, imp_color in rows:
+            cmp_rows_html += f"""
+        <tr>
+          <td class="metric-name">{metric}</td>
+          <td class="num" style="color:#3b82f6;font-weight:700">{model_v}</td>
+          <td class="num" style="color:#f59e0b">{bl_v}</td>
+          <td class="num" style="color:{imp_color};font-weight:700">{imp_v}</td>
+        </tr>"""
+
+        # Chart data for baseline overlay on time-bin chart
+        bl_per_bin = bl.get('per_bin', [])
+        bl_bin_ade_js   = json.dumps([round(b['ade'], 3) for b in bl_per_bin])
+        bl_bin_fde_js   = json.dumps([round(b['fde'], 3) for b in bl_per_bin])
+        bl_miss2_js     = json.dumps([round(b['miss'], 1) for b in bl_per_bin])
+        bl_miss5_js     = json.dumps([round(b.get('miss_5m', 0), 1) for b in bl_per_bin])
+        bl_miss10_js    = json.dumps([round(b.get('miss_10m', 0), 1) for b in bl_per_bin])
+        bl_miss20_js    = json.dumps([round(b.get('miss_20m', 0), 1) for b in bl_per_bin])
+
+        # Summary bar-chart data for 4 headline metrics
+        cmp_metrics_js   = json.dumps(['minADE6', 'minFDE6', 'p90 ADE', 'p90 FDE'])
+        cmp_model_js     = json.dumps([rd['mean_ade'], rd['mean_fde'], rd['p90_ade'], rd['p90_fde']])
+        cmp_baseline_js  = json.dumps([bl['mean_ade'], bl['mean_fde'], bl['p90_ade'], bl['p90_fde']])
+
+        comparison_section_html = f"""
+  <!-- ── Model vs Linear Baseline ── -->
+  <div class="section-title">Wayformer-AIS vs Linear Baseline</div>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Metric</th>
+        <th style="color:#3b82f6">Wayformer-AIS</th>
+        <th style="color:#f59e0b">Linear Baseline</th>
+        <th>Improvement</th>
+      </tr>
+    </thead>
+    <tbody>{cmp_rows_html}
+    </tbody>
+  </table>
+
+  <!-- ── Comparison bar chart ── -->
+  <div class="section-title">Error Comparison Chart</div>
+  <div class="charts-grid">
+    <div class="chart-box full-width">
+      <div class="chart-title">Wayformer-AIS vs Linear Baseline — Key Error Metrics (m)</div>
+      <div class="chart-canvas-wrap" style="height:220px">
+        <canvas id="chartComparison"></canvas>
+      </div>
+    </div>
+  </div>"""
+
+        comparison_js = f"""
+  // ── Chart: Model vs Baseline comparison ────────────────────────────────
+  const cmpMetrics   = {cmp_metrics_js};
+  const cmpModelVals = {cmp_model_js};
+  const cmpBaseVals  = {cmp_baseline_js};
+
+  new Chart(document.getElementById('chartComparison'), {{
+    type: 'bar',
+    data: {{
+      labels: cmpMetrics,
+      datasets: [
+        {{
+          label: 'Wayformer-AIS',
+          data: cmpModelVals,
+          backgroundColor: 'rgba(59,130,246,0.80)',
+          borderColor: '#3b82f6', borderWidth: 1, borderRadius: 4,
+        }},
+        {{
+          label: 'Linear Baseline',
+          data: cmpBaseVals,
+          backgroundColor: 'rgba(245,158,11,0.65)',
+          borderColor: '#f59e0b', borderWidth: 1, borderRadius: 4,
+        }},
+      ],
+    }},
+    options: darkOptions({{
+      plugins: {{
+        legend: {{ labels: {{ color: '#94a3b8', font: {{ size: 11 }} }} }},
+        tooltip: {{
+          backgroundColor: TOOLTIP_BG, titleColor: TOOLTIP_TITLE,
+          bodyColor: TOOLTIP_BODY, borderColor: '#334155', borderWidth: 1,
+          callbacks: {{ label: ctx => ` ${{ctx.dataset.label}}: ${{ctx.parsed.y.toFixed(3)}} m` }},
+        }},
+      }},
+      scales: {{
+        x: {{ grid: {{ color: GRID_COLOR }}, ticks: {{ color: TICK_COLOR, font: {{ size: 11 }} }} }},
+        y: {{
+          grid: {{ color: GRID_COLOR }}, ticks: {{ color: TICK_COLOR, font: {{ size: 10 }} }},
+          title: {{ display: true, text: 'Error (m)', color: TICK_COLOR, font: {{ size: 10 }} }},
+          beginAtZero: true,
+        }},
+      }},
+    }}),
+  }});
+
+  // Baseline overlays injected into time-bin charts after they are created
+  const blBinADE   = {bl_bin_ade_js};
+  const blBinFDE   = {bl_bin_fde_js};
+  const blMiss2    = {bl_miss2_js};
+  const blMiss5    = {bl_miss5_js};
+  const blMiss10   = {bl_miss10_js};
+  const blMiss20   = {bl_miss20_js};
+"""
+        baseline_datasets_timebin = """
+        {
+          label: 'Baseline ADE (m)',
+          data: blBinADE,
+          borderColor: '#f59e0b',
+          borderDash: [5, 3],
+          backgroundColor: 'transparent',
+          pointBackgroundColor: '#f59e0b',
+          tension: 0.3, fill: false, borderWidth: 1.5, pointRadius: 3,
+        },
+        {
+          label: 'Baseline FDE (m)',
+          data: blBinFDE,
+          borderColor: '#fb923c',
+          borderDash: [5, 3],
+          backgroundColor: 'transparent',
+          pointBackgroundColor: '#fb923c',
+          tension: 0.3, fill: false, borderWidth: 1.5, pointRadius: 3,
+        },"""
+        baseline_datasets_missrate = """
+        {
+          label: 'Baseline @ 2m',
+          data: blMiss2,
+          borderColor: '#ef4444', borderDash: [5,3],
+          backgroundColor: 'transparent', pointBackgroundColor: '#ef4444',
+          tension: 0.3, fill: false, borderWidth: 1.5, pointRadius: 3,
+        },
+        {
+          label: 'Baseline @ 5m',
+          data: blMiss5,
+          borderColor: '#f97316', borderDash: [5,3],
+          backgroundColor: 'transparent', pointBackgroundColor: '#f97316',
+          tension: 0.3, fill: false, borderWidth: 1.5, pointRadius: 3,
+        },
+        {
+          label: 'Baseline @ 10m',
+          data: blMiss10,
+          borderColor: '#f59e0b', borderDash: [5,3],
+          backgroundColor: 'transparent', pointBackgroundColor: '#f59e0b',
+          tension: 0.3, fill: false, borderWidth: 1.5, pointRadius: 3,
+        },
+        {
+          label: 'Baseline @ 20m',
+          data: blMiss20,
+          borderColor: '#22c55e', borderDash: [5,3],
+          backgroundColor: 'transparent', pointBackgroundColor: '#22c55e',
+          tension: 0.3, fill: false, borderWidth: 1.5, pointRadius: 3,
+        },"""
+    else:
+        comparison_section_html = ""
+        comparison_js = ""
+        baseline_datasets_timebin = ""
+        baseline_datasets_missrate = ""
 
     # ── Checkpoint short name ────────────────────────────────────────────────
     ckpt_short = os.path.basename(rd.get('ckpt_path', 'unknown'))
@@ -279,6 +473,8 @@ def create_report(report_data: dict, output_dir: str) -> str:
     </div>
   </div>
 
+{comparison_section_html}
+
   <!-- ── Distribution ── -->
   <div class="section-title">Error Distribution</div>
   <table class="dist-table">
@@ -468,6 +664,9 @@ def create_report(report_data: dict, output_dir: str) -> str:
     }}, extra || {{}});
   }}
 
+  // ── Baseline comparison charts ─────────────────────────────────────────
+{comparison_js}
+
   // ── Data ───────────────────────────────────────────────────────────────
   const binLabels  = {bin_labels_js};
   const binADE     = {bin_ade_js};
@@ -514,7 +713,7 @@ def create_report(report_data: dict, output_dir: str) -> str:
           fill: false,
           borderWidth: 2,
           pointRadius: 4,
-        }},
+        }},{baseline_datasets_timebin}
       ],
     }},
     options: darkOptions({{
@@ -706,7 +905,7 @@ def create_report(report_data: dict, output_dir: str) -> str:
           backgroundColor: 'rgba(34,197,94,0.12)',
           pointBackgroundColor: '#22c55e',
           tension: 0.3, fill: false, borderWidth: 2, pointRadius: 4,
-        }},
+        }},{baseline_datasets_missrate}
       ],
     }},
     options: darkOptions({{
