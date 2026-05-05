@@ -1,6 +1,6 @@
 # Local Evaluation Configuration
-exp_name: 'eval_9scenes_patched_coords'
-ckpt_path: '/home/aviv/Projects/UniTraj/training_results_100scenarios_ec2_14022026/best_model_epoch95.ckpt'
+exp_name: 'eval_9scenes_5min_s150_200_v2'
+ckpt_path: '/home/aviv/Projects/UniTraj/training_results_wayformer_5min_s150_200_v2/best_model_epoch96.ckpt'
 seed: 42
 debug: False
 devices: [ 0 ]
@@ -14,8 +14,8 @@ cache_path: "./cache"
 max_data_num: [ null ]
 starting_frame: [ 0 ]
 past_len: 300  # Must match training config
-future_len: 60  # Must match training config
-stride: 60 # stride=60 for 9-scene eval (~1760 samples)
+future_len: 300  # Must match training config
+stride: 150 # match training stride
 object_type: [ 'VESSEL' ]
 line_type: [ ]
 masked_attributes: [ 'z_axis', 'size' ]
@@ -33,4 +33,4 @@ eval_waymo: False
 eval_argoverse2: False
 
 defaults:
-  - method: wayformer_ais
+  - method: wayformer_ais_5min_ec2

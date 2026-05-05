@@ -1064,14 +1064,19 @@ class LeafletVisualizer:
             all_vessel_ids = [0]
             predicted_vessel_color = vessel_colors[0]
 
-        # Format metrics — show only 4 core metrics, deduplicated
-        _core_metric_keys = ['val/minADE6', 'val/minFDE6', 'val/miss_rate', 'val/brier_fde']
+        # Format metrics for sidebar
+        _core_metric_keys = ['val/minADE6', 'val/minFDE6', 'val/brier_fde',
+                             'val/miss_rate', 'val/miss_5m', 'val/miss_10m', 'val/miss_20m']
         _metric_labels = {
-            'val/minADE6':    ('minADE6',    'm',  '#3b82f6'),
-            'val/minFDE6':    ('minFDE6',    'm',  '#8b5cf6'),
-            'val/miss_rate':  ('Miss Rate',  '',   '#ef4444'),
-            'val/brier_fde':  ('Brier FDE',  'm',  '#f59e0b'),
+            'val/minADE6':    ('minADE6',      'm',  '#3b82f6'),
+            'val/minFDE6':    ('minFDE6',      'm',  '#8b5cf6'),
+            'val/brier_fde':  ('Brier FDE',    'm',  '#f59e0b'),
+            'val/miss_rate':  ('Miss @ 2m',    '',   '#ef4444'),
+            'val/miss_5m':    ('Miss @ 5m',    '',   '#f97316'),
+            'val/miss_10m':   ('Miss @ 10m',   '',   '#f59e0b'),
+            'val/miss_20m':   ('Miss @ 20m',   '',   '#22c55e'),
         }
+        _miss_keys = {'val/miss_rate', 'val/miss_5m', 'val/miss_10m', 'val/miss_20m'}
         metrics_html = ""
         if metrics:
             metrics_html = "<div class='metrics'><div class='metrics-title'>Evaluation Metrics</div><div class='metrics-grid'>"
@@ -1079,7 +1084,7 @@ class LeafletVisualizer:
                 if key in metrics:
                     val = metrics[key]
                     label, unit, color = _metric_labels[key]
-                    display = f"{val*100:.1f}%" if key == 'val/miss_rate' else f"{val:.2f}{unit}"
+                    display = f"{val*100:.1f}%" if key in _miss_keys else f"{val:.2f}{unit}"
                     metrics_html += (
                         f"<div class='metric-card'>"
                         f"<div class='metric-value' style='color:{color}'>{display}</div>"
@@ -1104,8 +1109,8 @@ class LeafletVisualizer:
         _all_steps = [(1, '1s'), (5, '5s'), (10, '10s'), (30, '30s'),
                       (60, '1min'), (300, '5min'), (600, '10min')]
         _valid_steps = [(v, lbl) for v, lbl in _all_steps if v >= viz_stride]
-        # default selection: first step >= viz_stride
-        _default_step = _valid_steps[0][0] if _valid_steps else viz_stride
+        # default selection: 5min (300s), fallback to first valid step
+        _default_step = 300 if any(v == 300 for v, _ in _valid_steps) else (_valid_steps[0][0] if _valid_steps else viz_stride)
         _step_options_html = '\n'.join(
             f'                <option value="{v}"{" selected" if v == _default_step else ""}>{lbl}</option>'
             for v, lbl in _valid_steps

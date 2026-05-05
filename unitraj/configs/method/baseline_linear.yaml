@@ -1,0 +1,30 @@
+# Baseline Linear Model – OLS extrapolation
+# Use this config to evaluate the classical linear baseline.
+# Swap into eval_local.yaml with:   defaults: - method: baseline_linear
+
+model_name: baseline_linear
+
+# Prediction window – must match the dataset config in the parent yaml
+num_modes: 6
+
+# No real training, but Lightning needs these fields
+max_epochs: 1
+learning_rate: 0.0001
+train_batch_size: 64
+eval_batch_size: 256
+
+# Data dimensions – keep identical to wayformer_ais for fair comparison
+num_agent_feature: 39
+num_map_feature: 1
+max_num_agents: 10
+map_range: 22000
+position_scale: 100.0
+velocity_scale: 20.0
+max_num_roads: 1
+max_points_per_lane: 1
+manually_split_lane: False
+point_sampled_interval: 1
+num_points_each_polyline: 1
+vector_break_dist_thresh: 1.0
+use_map_image: False
+use_map_lanes: False

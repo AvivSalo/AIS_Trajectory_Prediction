@@ -20,8 +20,8 @@ def create_report(report_data: dict, output_dir: str) -> str:
           eval_duration_s, ms_per_sample, ms_per_batch, samples_per_sec,
           mean_ade, std_ade, p50_ade, p90_ade, p95_ade,
           mean_fde, std_fde, p50_fde, p90_fde, p95_fde,
-          miss_2m, miss_4m, miss_8m,
-          per_bin  : list[{label, count, ade, fde, miss, miss_4m, miss_8m}]
+          miss_2m, miss_5m, miss_10m, miss_20m,
+          per_bin  : list[{label, count, ade, fde, miss, miss_5m, miss_10m, miss_20m}]
           per_vessel: list[{vessel_id, samples, ade, fde, miss, p90_fde, html_file}]
           cdf_x, cdf_y          : FDE CDF curve (150 pts)
           hist_labels, hist_counts : ADE histogram
@@ -42,8 +42,9 @@ def create_report(report_data: dict, output_dir: str) -> str:
     bin_ade_js       = json.dumps([round(b['ade'], 3) for b in per_bin])
     bin_fde_js       = json.dumps([round(b['fde'], 3) for b in per_bin])
     bin_miss2_js     = json.dumps([round(b['miss'], 1) for b in per_bin])
-    bin_miss4_js     = json.dumps([round(b.get('miss_4m', 0), 1) for b in per_bin])
-    bin_miss8_js     = json.dumps([round(b.get('miss_8m', 0), 1) for b in per_bin])
+    bin_miss5_js     = json.dumps([round(b.get('miss_5m',  0), 1) for b in per_bin])
+    bin_miss10_js    = json.dumps([round(b.get('miss_10m', 0), 1) for b in per_bin])
+    bin_miss20_js    = json.dumps([round(b.get('miss_20m', 0), 1) for b in per_bin])
 
     sorted_vessels = sorted(per_vessel, key=lambda x: x['ade'])
     vessel_names_js = json.dumps([v['vessel_id'].replace('ais_', '') for v in sorted_vessels])
@@ -262,14 +263,19 @@ def create_report(report_data: dict, output_dir: str) -> str:
       <div class="card-sub">FDE threshold = 2 m</div>
     </div>
     <div class="card">
-      <div class="card-value" style="color:#f59e0b">{rd['miss_4m']:.1f}%</div>
-      <div class="card-label">Miss Rate @ 4 m</div>
-      <div class="card-sub">FDE threshold = 4 m</div>
+      <div class="card-value" style="color:#f97316">{rd['miss_5m']:.1f}%</div>
+      <div class="card-label">Miss Rate @ 5 m</div>
+      <div class="card-sub">FDE threshold = 5 m</div>
     </div>
     <div class="card">
-      <div class="card-value" style="color:#22c55e">{rd['miss_8m']:.1f}%</div>
-      <div class="card-label">Miss Rate @ 8 m</div>
-      <div class="card-sub">FDE threshold = 8 m</div>
+      <div class="card-value" style="color:#f59e0b">{rd['miss_10m']:.1f}%</div>
+      <div class="card-label">Miss Rate @ 10 m</div>
+      <div class="card-sub">FDE threshold = 10 m</div>
+    </div>
+    <div class="card">
+      <div class="card-value" style="color:#22c55e">{rd['miss_20m']:.1f}%</div>
+      <div class="card-label">Miss Rate @ 20 m</div>
+      <div class="card-sub">FDE threshold = 20 m</div>
     </div>
   </div>
 
@@ -344,7 +350,10 @@ def create_report(report_data: dict, output_dir: str) -> str:
 
     <!-- Chart 5: Miss Rate at Multiple Thresholds by Time Bin -->
     <div class="chart-box full-width">
-      <div class="chart-title">Miss Rate at Multiple Thresholds by Time Offset (@2m / @4m / @8m)</div>
+      <div class="chart-title">Miss Rate at Multiple Thresholds by Time Offset (@2m / @5m / @10m / @20m)</div>
+      <div style="font-size:11px;color:#64748b;margin:-6px 0 10px 2px;">
+        A prediction <em>misses</em> when the best-mode <strong>final displacement error (FDE)</strong> exceeds the threshold.
+      </div>
       <div class="chart-canvas-wrap tall">
         <canvas id="chartMissRate"></canvas>
       </div>
@@ -464,8 +473,9 @@ def create_report(report_data: dict, output_dir: str) -> str:
   const binADE     = {bin_ade_js};
   const binFDE     = {bin_fde_js};
   const binMiss2   = {bin_miss2_js};
-  const binMiss4   = {bin_miss4_js};
-  const binMiss8   = {bin_miss8_js};
+  const binMiss5   = {bin_miss5_js};
+  const binMiss10  = {bin_miss10_js};
+  const binMiss20  = {bin_miss20_js};
 
   const vesselNames = {vessel_names_js};
   const vesselADE   = {vessel_ade_js};
@@ -661,36 +671,41 @@ def create_report(report_data: dict, output_dir: str) -> str:
 
   // ── Chart 5: Miss Rate at Multiple Thresholds by Time Bin ──────────────
   new Chart(document.getElementById('chartMissRate'), {{
-    type: 'bar',
+    type: 'line',
     data: {{
       labels: binLabels,
       datasets: [
         {{
           label: 'Miss @ 2m',
           data: binMiss2,
-          backgroundColor: 'rgba(239,68,68,0.8)',
           borderColor: '#ef4444',
-          borderWidth: 1,
-          borderRadius: 3,
-          stack: 'miss',
+          backgroundColor: 'rgba(239,68,68,0.12)',
+          pointBackgroundColor: '#ef4444',
+          tension: 0.3, fill: false, borderWidth: 2, pointRadius: 4,
         }},
         {{
-          label: 'Miss @ 4m (additional)',
-          data: binMiss4.map((v, i) => Math.max(0, v - binMiss2[i])),
-          backgroundColor: 'rgba(245,158,11,0.8)',
+          label: 'Miss @ 5m',
+          data: binMiss5,
+          borderColor: '#f97316',
+          backgroundColor: 'rgba(249,115,22,0.12)',
+          pointBackgroundColor: '#f97316',
+          tension: 0.3, fill: false, borderWidth: 2, pointRadius: 4,
+        }},
+        {{
+          label: 'Miss @ 10m',
+          data: binMiss10,
           borderColor: '#f59e0b',
-          borderWidth: 1,
-          borderRadius: 0,
-          stack: 'miss',
+          backgroundColor: 'rgba(245,158,11,0.12)',
+          pointBackgroundColor: '#f59e0b',
+          tension: 0.3, fill: false, borderWidth: 2, pointRadius: 4,
         }},
         {{
-          label: 'Miss @ 8m (additional)',
-          data: binMiss8.map((v, i) => Math.max(0, v - binMiss4[i])),
-          backgroundColor: 'rgba(34,197,94,0.8)',
+          label: 'Miss @ 20m',
+          data: binMiss20,
           borderColor: '#22c55e',
-          borderWidth: 1,
-          borderRadius: 0,
-          stack: 'miss',
+          backgroundColor: 'rgba(34,197,94,0.12)',
+          pointBackgroundColor: '#22c55e',
+          tension: 0.3, fill: false, borderWidth: 2, pointRadius: 4,
         }},
       ],
     }},
@@ -702,25 +717,16 @@ def create_report(report_data: dict, output_dir: str) -> str:
           bodyColor: TOOLTIP_BODY, borderColor: '#334155', borderWidth: 1,
           mode: 'index',
           callbacks: {{
-            label: ctx => {{
-              const label = ctx.dataset.label;
-              const idx = ctx.dataIndex;
-              if (label.startsWith('Miss @ 2m')) return ` Miss@2m: ${{binMiss2[idx].toFixed(1)}}%`;
-              if (label.startsWith('Miss @ 4m')) return ` Miss@4m: ${{binMiss4[idx].toFixed(1)}}%`;
-              if (label.startsWith('Miss @ 8m')) return ` Miss@8m: ${{binMiss8[idx].toFixed(1)}}%`;
-              return '';
-            }},
+            label: ctx => ` ${{ctx.dataset.label}}: ${{ctx.parsed.y.toFixed(1)}}%`,
           }},
         }},
       }},
       scales: {{
         x: {{
-          stacked: true,
           grid: {{ color: GRID_COLOR }},
           ticks: {{ color: TICK_COLOR, font: {{ size: 10 }}, maxRotation: 30 }},
         }},
         y: {{
-          stacked: true,
           grid: {{ color: GRID_COLOR }}, ticks: {{ color: TICK_COLOR, font: {{ size: 10 }} }},
           title: {{ display: true, text: 'Miss Rate (%)', color: TICK_COLOR, font: {{ size: 10 }} }},
           min: 0,

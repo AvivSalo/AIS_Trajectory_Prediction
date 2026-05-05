@@ -1,4 +1,5 @@
 from unitraj.models.autobot.autobot import AutoBotEgo
+from unitraj.models.baseline_linear.baseline_linear import BaselineLinear
 from unitraj.models.mtr.MTR import MotionTransformer
 from unitraj.models.wayformer.wayformer import Wayformer
 
@@ -7,6 +8,7 @@ __all__ = {
     'wayformer': Wayformer,
     'wayformer_ais': Wayformer,  # Use same Wayformer model for AIS data
     'MTR': MotionTransformer,
+    'baseline_linear': BaselineLinear,
 }
 
 

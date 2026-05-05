@@ -31,7 +31,8 @@ class EvaluationCallback(pl.Callback):
         self.all_sample_metrics = []     # [{vessel_id, time_offset, min_ade_m, min_fde_m, miss}]
         self.vessel_first_gt = {}        # {vessel_id: gt_norm [T,2]} — GT for first window only
         self.vessel_first_scene_ctx = {} # {vessel_id: scene_context dict} — first window only
-        self.output_dir = "evaluation_visualizations"
+        exp_name = str(getattr(config, 'exp_name', '')) if config is not None else ''
+        self.output_dir = f"evaluation_visualizations_{exp_name}" if exp_name else "evaluation_visualizations"
         self.config = config
         self._eval_start_time = None
         self._batch_count = 0
@@ -105,6 +106,9 @@ class EvaluationCallback(pl.Callback):
                     'min_ade_m': float(min_ade_m[i]),
                     'min_fde_m': float(min_fde_m[i]),
                     'miss': bool(miss[i]),
+                    'miss_5m':  bool(min_fde_m[i] > 5.0),
+                    'miss_10m': bool(min_fde_m[i] > 10.0),
+                    'miss_20m': bool(min_fde_m[i] > 20.0),
                 })
 
                 # Store first window's data for visualization (GT + scene context)
@@ -167,18 +171,22 @@ class EvaluationCallback(pl.Callback):
                         'ade':     float(all_ade[mask].mean()),
                         'fde':     float(all_fde[mask].mean()),
                         'miss':    float(all_miss[mask].mean()) * 100,
-                        'miss_4m': float((all_fde[mask] > 4.0).mean()) * 100,
-                        'miss_8m': float((all_fde[mask] > 8.0).mean()) * 100,
+                        'miss_5m':  float((all_fde[mask] > 5.0).mean()) * 100,
+                        'miss_10m': float((all_fde[mask] > 10.0).mean()) * 100,
+                        'miss_20m': float((all_fde[mask] > 20.0).mean()) * 100,
                     })
 
             # --- Per-vessel metrics ---
             vessel_metrics_map = {}
             for m in self.all_sample_metrics:
                 vid = m['vessel_id']
-                vessel_metrics_map.setdefault(vid, {'ade': [], 'fde': [], 'miss': []})
+                vessel_metrics_map.setdefault(vid, {'ade': [], 'fde': [], 'miss': [], 'miss_5m': [], 'miss_10m': [], 'miss_20m': []})
                 vessel_metrics_map[vid]['ade'].append(m['min_ade_m'])
                 vessel_metrics_map[vid]['fde'].append(m['min_fde_m'])
                 vessel_metrics_map[vid]['miss'].append(float(m['miss']))
+                vessel_metrics_map[vid]['miss_5m'].append(float(m['miss_5m']))
+                vessel_metrics_map[vid]['miss_10m'].append(float(m['miss_10m']))
+                vessel_metrics_map[vid]['miss_20m'].append(float(m['miss_20m']))
 
             # --- Print summary ---
             print(f"\n📊 Dense Evaluation — Val Scenes (stride=1)")
@@ -220,6 +228,9 @@ class EvaluationCallback(pl.Callback):
                         'val/minADE6':   float(np.mean(vm['ade'])),
                         'val/minFDE6':   float(np.mean(vm['fde'])),
                         'val/miss_rate': float(np.mean(vm['miss'])),
+                        'val/miss_5m':   float(np.mean(vm['miss_5m'])),
+                        'val/miss_10m':  float(np.mean(vm['miss_10m'])),
+                        'val/miss_20m':  float(np.mean(vm['miss_20m'])),
                     }
 
                 scenario_id_with_t = f"{vessel_id}_t{first_time_offset}"
@@ -302,8 +313,9 @@ class EvaluationCallback(pl.Callback):
                 'p90_fde':    round(float(np.percentile(all_fde, 90)), 3),
                 'p95_fde':    round(float(np.percentile(all_fde, 95)), 3),
                 'miss_2m':    round(float((all_fde > 2.0).mean()) * 100, 1),
-                'miss_4m':    round(float((all_fde > 4.0).mean()) * 100, 1),
-                'miss_8m':    round(float((all_fde > 8.0).mean()) * 100, 1),
+                'miss_5m':    round(float((all_fde > 5.0).mean()) * 100, 1),
+                'miss_10m':   round(float((all_fde > 10.0).mean()) * 100, 1),
+                'miss_20m':   round(float((all_fde > 20.0).mean()) * 100, 1),
                 'per_bin':      per_bin,
                 'per_vessel':   per_vessel_list,
                 # Chart data
