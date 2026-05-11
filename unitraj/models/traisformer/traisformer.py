@@ -229,25 +229,42 @@ class TrAISformer(BaseModel):
 
     @torch.no_grad()
     def _sample_modes(self, past_ch: torch.Tensor, K: int) -> torch.Tensor:
-        """Run K independent autoregressive rollouts.
+        """Run K independent autoregressive rollouts using KV caching.
+
+        Without caching, each future timestep re-runs full attention over the
+        entire (growing) sequence — O(T_fut * (T_past + T_fut)^2 * n_layer).
+        With a KV cache we pay O((T_past + T_fut) * n_layer * n_embd^2) once
+        plus O(T_fut * (T_past + T_fut) * n_layer * n_embd) for the per-step
+        attentions — roughly a 50-100x speedup at our shapes.
 
         past_ch : (B, T_past, 4)
         returns : (B, K, T_fut, 2)
         """
         B = past_ch.shape[0]
+        T_past = self.past_len
         T_fut = self.future_len
 
         # Encode past once; tile K-fold along batch dim.
         past_tok = self.tokenizer.encode(past_ch)                         # (B, T_past, 4)
-        tokens = past_tok.unsqueeze(1).expand(-1, K, -1, -1).reshape(B * K, -1, 4)
+        tokens_bk = past_tok.unsqueeze(1).expand(-1, K, -1, -1).reshape(B * K, T_past, 4)
 
-        for _ in range(T_fut):
-            logits = self.net(tokens)
-            last_logits = {ch: logits[ch][:, -1, :] for ch in logits}
+        # 1) Initial pass: warm the KV cache with the entire past in one shot.
+        logits, caches = self.net.forward_step(tokens_bk, past_caches=None, position_offset=0)
+        last_logits = {ch: logits[ch][:, -1, :] for ch in logits}
+
+        # 2) Autoregressive loop: each iteration appends exactly one new token,
+        #    and only that token's Q is computed against the cached K, V.
+        generated = []
+        for step in range(T_fut):
             next_tok = self._sample_next(last_logits)                     # (B*K, 4)
-            tokens = torch.cat([tokens, next_tok.unsqueeze(1)], dim=1)
+            generated.append(next_tok)
+            next_tok_seq = next_tok.unsqueeze(1)                          # (B*K, 1, 4)
+            logits, caches = self.net.forward_step(
+                next_tok_seq, past_caches=caches, position_offset=T_past + step,
+            )
+            last_logits = {ch: logits[ch][:, -1, :] for ch in logits}
 
-        fut_tokens = tokens[:, -T_fut:]                                   # (B*K, T_fut, 4)
+        fut_tokens = torch.stack(generated, dim=1)                        # (B*K, T_fut, 4)
         xy = self.tokenizer.decode_xy(fut_tokens[..., 0], fut_tokens[..., 1])
         return xy.view(B, K, T_fut, 2)
 
