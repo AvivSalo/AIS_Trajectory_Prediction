@@ -41,5 +41,11 @@ eval_nuscenes: False
 eval_waymo: False
 eval_argoverse2: False
 
+# Cap each per-epoch validation pass to N batches. Required for TrAISformer
+# because its K-mode autoregressive sampling is ~3s/sample — a full val epoch
+# on ~4000 scenarios = ~3.5 hours without this cap. 64 batches × eval_batch_size=16
+# = 1024 samples, which gives stable ADE/FDE estimates in ~5 min/val epoch.
+limit_val_batches: 64
+
 defaults:
   - method: traisformer

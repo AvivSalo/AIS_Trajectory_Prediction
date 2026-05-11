@@ -48,6 +48,11 @@ def train(cfg):
         val_set, batch_size=eval_batch_size, num_workers=cfg.load_num_workers, shuffle=False, drop_last=False,
         collate_fn=train_set.collate_fn)
 
+    # Optional val-batch cap: useful for models with expensive validation
+    # (e.g. autoregressive TrAISformer at K=6 modes — full val epoch ~hours).
+    # Set `limit_val_batches: N` in the parent config to cap each val pass.
+    limit_val_batches = cfg.get('limit_val_batches', None)
+
     trainer = pl.Trainer(
         max_epochs=cfg.method.max_epochs,
         logger=None if cfg.debug else WandbLogger(project="unitraj", name=cfg.exp_name, id=cfg.exp_name,
@@ -58,7 +63,8 @@ def train(cfg):
         accelerator="cpu" if cfg.debug else "gpu",
         profiler="simple",
         strategy="auto" if cfg.debug else "ddp",
-        callbacks=call_backs
+        callbacks=call_backs,
+        limit_val_batches=limit_val_batches if limit_val_batches is not None else 1.0,
     )
 
     # automatically resume training
