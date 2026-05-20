@@ -1,0 +1,52 @@
+# =============================================================================
+# TrAISformer training config — mirrors config_5min_future_ec2.yaml's data
+# settings but trains the TrAISformer baseline (see configs/method/traisformer.yaml).
+#
+# The data pipeline is intentionally IDENTICAL to the Wayformer-AIS 5-min run
+# so reported numbers compare apples-to-apples on the same test set.
+# =============================================================================
+
+# exp setting
+exp_name: 'traisformer_5min_v2'   # MUST bump suffix on re-runs — W&B refuses to recreate
+                                   # deleted run IDs (HTTP 409 from upsertBucket).
+ckpt_path: null
+seed: 42
+debug: False
+devices: [ 0 ]
+normalize_data: True
+
+# data related — same paths/horizons as Wayformer's 5-min EC2 run
+load_num_workers: 6
+train_data_path: [ "/home/ubuntu/projects/AIS_Trajectory_Prediction/unitraj/data/processed_ais_4hours_optimized/train" ]
+val_data_path: [ "/home/ubuntu/projects/AIS_Trajectory_Prediction/unitraj/data/processed_ais_4hours_optimized/val" ]
+cache_path: "./cache_5min"
+max_data_num: [ 100 ]              # 100 pickle files ~ matches Wayformer-AIS 5min run
+starting_frame: [ 0 ]
+past_len: 300                      # 5 min history @ 1 Hz
+future_len: 300                    # 5 min prediction @ 1 Hz
+stride: 300                        # non-overlapping windows
+object_type: [ 'VESSEL' ]
+line_type: [ ]
+masked_attributes: [ 'z_axis', 'size' ]
+trajectory_sample_interval: 1
+only_train_on_ego: False           # TrAISformer is single-agent internally; loader still emits
+                                   # all agents for shape-compatibility with Wayformer
+center_offset_of_map: [ 0.0, 0.0 ]
+use_cache: True
+overwrite_cache: True
+store_data_in_memory: False
+
+# official evaluation (not applicable for AIS)
+nuscenes_dataroot: ''
+eval_nuscenes: False
+eval_waymo: False
+eval_argoverse2: False
+
+# Cap each per-epoch validation pass to N batches. Required for TrAISformer
+# because its K-mode autoregressive sampling is ~3s/sample — a full val epoch
+# on ~4000 scenarios = ~3.5 hours without this cap. 64 batches × eval_batch_size=16
+# = 1024 samples, which gives stable ADE/FDE estimates in ~5 min/val epoch.
+limit_val_batches: 64
+
+defaults:
+  - method: traisformer

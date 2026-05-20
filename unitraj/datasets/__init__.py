@@ -8,6 +8,7 @@ __all__ = {
     'wayformer': WayformerDataset,
     'wayformer_ais': AISDataset,  # AIS-specific wayformer dataset
     'MTR': MTRDataset,
+    'traisformer': AISDataset,    # TrAISformer baseline shares the AIS dataset
 }
 
 

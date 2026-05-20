@@ -1,0 +1,95 @@
+# =============================================================================
+# TrAISformer (CIA-Oceanix/TrAISformer) — adapted to Aviv's UniTraj AIS pipeline
+# =============================================================================
+#
+# WHAT THIS IS
+# ------------
+# A GPT-style autoregressive transformer that predicts vessel trajectories from
+# AIS sequences, using a "fourhot" categorical representation of
+# (x, y, sog, cog) per timestep. Original paper:
+#   Nguyen & Fablet (2024), https://arxiv.org/abs/2109.03958
+#
+# WHAT WE LEARNED ABOUT THE DATA  (see scripts/inspect_ais_ranges.py)
+# ------------------------------------------------------------------
+# Aviv's UniTraj-processed AIS data:
+#   - 1 Hz sampling. Parent config sets past_len=300, future_len=300 → 5-min/5-min.
+#   - Ego-relative coordinate frame (rotated to ego's initial heading).
+#   - Positions normalized by position_scale=100m → x, y in "hectometers".
+#   - Velocities normalized by velocity_scale=20 m/s.
+#   - Empirical ranges from EC2 training data (1000 scenarios, 50 pickle files):
+#       x (lateral)  p99.9: ±26 hm   ≈ ±2.6 km
+#       y (forward)  p99.9: ±25 hm   ≈ ±2.5 km
+#       speed         max : 0.54     ≈ 21 knots (typical container/tanker traffic)
+#       cog (rel.)        : full ±π circle, std ≈ 0.61 rad ≈ 35°
+#   - cog here is heading RELATIVE TO EGO INITIAL HEADING (not absolute COG).
+#   - "22 km" elsewhere in the codebase is `map_range` (12 NM scenario extent,
+#     i.e. the AIS reception radius around ego). NOT a normalization constant.
+#
+# PATH B ADAPTATION (vs. the paper's 10-min sampling, 3h-15h horizon)
+# -------------------------------------------------------------------
+# - Token sequence length = past_len + future_len = 600 (paper: ~108).
+# - Bin sizes below are sized for our dense short-range regime, not the paper's.
+# - Single-agent only (ego); other agents ignored. TrAISformer is marginal by
+#   design — this aligns with Aviv's thesis ego-centric approach.
+# =============================================================================
+
+model_name: traisformer
+
+# ----- Fourhot quantization GRID BOUNDS (UniTraj-normalized space) -----
+# Derived empirically from the EC2 training set (p0.1/p99.9 with 10% headroom).
+x_min: -31.36          # hectometers; ±31 hm ≈ ±3.1 km
+x_max:  31.15
+y_min: -30.22
+y_max:  30.31
+sog_max: 1.0           # = velocity_scale ceiling = 20 m/s ≈ 38.9 kn (conservative)
+cog_min: -3.1416       # radians, full circle (cog is ego-relative heading)
+cog_max:  3.1416
+
+# ----- Fourhot quantization BIN COUNTS -----
+# Paper used (lat=250, lon=270, sog=30, cog=72) for ~250 km × 200 km Danish ROI.
+# Our ego-relative span is ~6.3 km in each axis. With 256 bins per axis we get
+# ~25 m per bin, which keeps signal-to-noise good even for slow vessels
+# (a 10.8 m/s vessel moves ~0.4 bin per 1 s step → trajectory advances per
+# timestep is visible at the bin level).
+x_size: 256
+y_size: 256
+sog_size: 30           # 0..1 (UniTraj-normalized) at 1/30 ≈ 0.033 resolution ≈ 0.67 m/s per bin
+cog_size: 72           # 5° per bin — matches the paper for cog
+
+# ----- Transformer hyperparameters -----
+n_layer: 8
+n_head: 8
+n_embd: 256
+dropout: 0.1
+
+# ----- Inference (multi-modal output) -----
+# K modes for fair comparison with Wayformer's K=6 minADE6/minFDE6.
+# Set num_modes=1 for a greedy/ablation run (single autoregressive rollout).
+num_modes: 6
+sample_temperature: 1.0   # raise above 1.0 for more diverse modes, lower for more peaked
+
+# ----- Training -----
+learning_rate: 6.0e-4     # paper used 6e-4 with cyclic cosine LR
+weight_decay: 0.0
+max_epochs: 50            # paper: 50 epochs with early stopping
+optimizer: AdamW
+scheduler: cosine
+grad_clip_norm: 1.0
+train_batch_size: 8
+eval_batch_size: 16       # autoregressive K rollouts are expensive — keep small
+
+# ----- Data dimensions — keep identical to wayformer_ais for fair comparison -----
+num_agent_feature: 39
+num_map_feature: 1
+max_num_agents: 10
+map_range: 22000          # 12 NM scenario extent (NOT a normalization divisor)
+position_scale: 100.0
+velocity_scale: 20.0
+max_num_roads: 1
+max_points_per_lane: 1
+manually_split_lane: False
+point_sampled_interval: 1
+num_points_each_polyline: 1
+vector_break_dist_thresh: 1.0
+use_map_image: False
+use_map_lanes: False
