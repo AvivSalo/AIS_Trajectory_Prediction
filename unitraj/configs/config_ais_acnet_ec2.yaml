@@ -40,5 +40,9 @@ eval_nuscenes: False
 eval_waymo: False
 eval_argoverse2: False
 
+# AIS-ACNet's dual-encoder has auxiliary-network params that are decoupled from
+# the main-net skip in some forward passes, triggering DDP's unused-param check.
+ddp_strategy: ddp_find_unused_parameters_true
+
 defaults:
   - method: ais_acnet
