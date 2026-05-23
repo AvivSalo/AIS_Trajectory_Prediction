@@ -75,7 +75,7 @@ def train(cfg):
 
     trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader, ckpt_path=cfg.ckpt_path)
 
-    if not cfg.debug and checkpoint_callback.best_model_path:
+    if not cfg.debug and trainer.global_rank == 0 and checkpoint_callback.best_model_path:
         config_path = os.path.join(checkpoint_callback.dirpath, "config.yaml")
         OmegaConf.save(cfg, config_path)
 
@@ -83,6 +83,7 @@ def train(cfg):
         artifact.add_file(checkpoint_callback.best_model_path, name="best_model.ckpt")
         artifact.add_file(config_path, name="config.yaml")
         wandb.log_artifact(artifact)
+        artifact.wait()
 
 
 if __name__ == '__main__':
