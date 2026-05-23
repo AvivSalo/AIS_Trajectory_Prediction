@@ -1,0 +1,50 @@
+# AIS-ACNet method config
+# Reference: Shin et al. (2024), EAAI 132, 107936
+# Source:    https://github.com/yuyolshin/AIS-ACNet
+model_name: ais_acnet
+
+# ---- GWNet architecture (faithful to original paper) ----
+# nhid = residual_channels = dilation_channels (paper uses 32)
+nhid: 32
+skip_channels_multiplier: 8    # skip_channels  = nhid * 8  = 256
+end_channels_multiplier: 16    # end_channels   = nhid * 16 = 512
+kernel_size: 2
+dropout: 0.3
+
+# Dilation factors: exponential schedule covers T ≤ 1023 steps
+# (replaces the original blocks=5, layers=2 with dilations [1,2,1,2,...]
+#  which only covered 15 steps; 10 layers kept to match param count)
+dilation_factors: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+
+# ---- Multi-task loss weights (paper default: α=β=0.2) ----
+aux_sog_weight: 0.2   # weight for vx auxiliary loss
+aux_cog_weight: 0.2   # weight for vy auxiliary loss
+
+# ---- UniTraj interface ----
+num_modes: 1          # deterministic single-mode prediction
+use_map_image: False
+use_map_lanes: False
+
+# ---- Data config (must match top-level config) ----
+num_agent_feature: 39
+num_map_feature: 1
+max_num_agents: 10
+map_range: 22000
+position_scale: 100.0
+velocity_scale: 20.0
+max_num_roads: 1
+max_points_per_lane: 1
+manually_split_lane: False
+point_sampled_interval: 1
+num_points_each_polyline: 1
+vector_break_dist_thresh: 1.0
+
+# ---- Training ----
+max_epochs: 100
+learning_rate: 0.001
+learning_rate_sched: [80, 90]
+optimizer: Adam
+weight_decay: 0.0001
+grad_clip_norm: 5
+train_batch_size: 32
+eval_batch_size: 64
