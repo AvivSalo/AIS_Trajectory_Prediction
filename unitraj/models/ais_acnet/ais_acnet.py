@@ -271,7 +271,7 @@ class AISACNet(BaseModel):
         inputs       = batch['input_dict']
         obj_trajs    = inputs['obj_trajs']           # (B, max_agents, T, 39)
         obj_mask     = inputs['obj_trajs_mask']      # (B, max_agents, T)
-        track_idx    = inputs['track_index_to_predict'].long()  # (B,)
+        track_idx    = inputs['track_index_to_predict'].long().squeeze(-1)  # (B,)
 
         B      = obj_trajs.shape[0]
         device = obj_trajs.device
