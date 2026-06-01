@@ -71,7 +71,7 @@ sample_temperature: 1.0   # raise above 1.0 for more diverse modes, lower for mo
 # ----- Training -----
 learning_rate: 6.0e-4     # paper used 6e-4 with cyclic cosine LR
 weight_decay: 0.0
-max_epochs: 50            # paper: 50 epochs with early stopping
+max_epochs: 100           # bumped from 50 for fair comparison with Wayformer/AIS-ACNet
 optimizer: AdamW
 scheduler: cosine
 grad_clip_norm: 1.0

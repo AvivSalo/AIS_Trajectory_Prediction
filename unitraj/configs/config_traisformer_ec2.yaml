@@ -7,7 +7,7 @@
 # =============================================================================
 
 # exp setting
-exp_name: 'traisformer_5min_v2'   # MUST bump suffix on re-runs — W&B refuses to recreate
+exp_name: 'traisformer_5min_v3'   # MUST bump suffix on re-runs — W&B refuses to recreate
                                    # deleted run IDs (HTTP 409 from upsertBucket).
 ckpt_path: null
 seed: 42
