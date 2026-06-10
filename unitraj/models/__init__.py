@@ -1,6 +1,7 @@
 from unitraj.models.ais_acnet.ais_acnet import AISACNet
 from unitraj.models.autobot.autobot import AutoBotEgo
 from unitraj.models.baseline_linear.baseline_linear import BaselineLinear
+from unitraj.models.gat_lstm.gat_lstm import GATLSTM
 from unitraj.models.mtr.MTR import MotionTransformer
 from unitraj.models.traisformer.traisformer import TrAISformer
 from unitraj.models.wayformer.wayformer import Wayformer
@@ -8,6 +9,7 @@ from unitraj.models.wayformer.wayformer import Wayformer
 __all__ = {
     'ais_acnet': AISACNet,
     'autobot': AutoBotEgo,
+    'gat_lstm': GATLSTM,
     'wayformer': Wayformer,
     'wayformer_ais': Wayformer,  # Use same Wayformer model for AIS data
     'MTR': MotionTransformer,
