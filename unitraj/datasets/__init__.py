@@ -10,6 +10,7 @@ __all__ = {
     'MTR': MTRDataset,
     'traisformer': AISDataset,    # TrAISformer baseline shares the AIS dataset
     'ais_acnet': AISDataset,      # AIS-ACNet baseline shares the AIS dataset
+    'gat_lstm': AISDataset,       # GAT-LSTM baseline shares the AIS dataset
 }
 
 
