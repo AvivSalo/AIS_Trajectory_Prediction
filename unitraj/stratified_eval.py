@@ -76,6 +76,7 @@ def main(cfg):
     past_len = int(getattr(cfg, "past_len", 300))
     batch_size = int(getattr(cfg, "eval_batch_size", 96))
     model_name = str(getattr(cfg, "model_name", ""))
+    max_batches = getattr(cfg, "eval_max_batches", None)
 
     device = torch.device("cuda" if (torch.cuda.is_available() and not cfg.debug) else "cpu")
 
@@ -100,6 +101,9 @@ def main(cfg):
 
     with torch.no_grad():
         for bi, batch in enumerate(loader):
+            if max_batches is not None and bi >= int(max_batches):
+                print(f"Stopping early at {max_batches} batches (eval_max_batches).")
+                break
             batch["input_dict"] = _to_device(batch["input_dict"], device)
             inp = batch["input_dict"]
 
