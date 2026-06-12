@@ -168,6 +168,29 @@ def classify_maneuver(past_xy, future_xy, dt=1.0,
     return result
 
 
+def signed_turn_deg(xy, frac=0.2):
+    """
+    Net SIGNED heading change (deg) along a trajectory: heading of the final segment minus
+    heading of the initial segment, wrapped to [-180, 180]. Positive = port/left turn (CCW),
+    negative = starboard/right turn (CW), ~0 = straight.
+
+    Uses the first/last `frac` of the path to estimate start/end heading robustly against
+    per-step AIS noise. Returns 0.0 for degenerate (too short / near-zero motion) inputs.
+    """
+    xy = np.asarray(xy, dtype=np.float64)[:, :2]
+    n = xy.shape[0]
+    if n < 4:
+        return 0.0
+    k = max(2, int(n * frac))
+    d0 = xy[k] - xy[0]
+    d1 = xy[-1] - xy[-k]
+    if np.linalg.norm(d0) < 1e-6 or np.linalg.norm(d1) < 1e-6:
+        return 0.0
+    h0 = np.arctan2(d0[1], d0[0])
+    h1 = np.arctan2(d1[1], d1[0])
+    return float(np.degrees(_wrap_to_pi(h1 - h0)))
+
+
 def _valid_xy(traj, mask, max_len=None):
     """Return the valid xy rows (mask>0) of a [T, >=2] trajectory in order."""
     traj = np.asarray(traj)

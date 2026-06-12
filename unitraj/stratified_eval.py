@@ -37,7 +37,7 @@ from torch.utils.data import DataLoader
 
 from models import build_model
 from datasets import build_dataset
-from datasets.maneuver_utils import classify_maneuver, classify_batch, COARSE_ORDER
+from datasets.maneuver_utils import classify_maneuver, classify_batch, signed_turn_deg, COARSE_ORDER
 from utils.utils import set_seed
 
 CLAUDEDOCS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "claudedocs")
@@ -139,13 +139,21 @@ def main(cfg):
             obj_mask = inp["obj_trajs_mask"].cpu().numpy()
             tip = inp["track_index_to_predict"].cpu().numpy().reshape(-1)
             pred_np = pred.cpu().numpy()
+            gt_np = gt.cpu().numpy()
             B = pred_np.shape[0]
             for i in range(B):
                 a = int(tip[i])
                 m = obj_mask[i, a, :past_len].astype(bool)
                 past_xy = obj_trajs[i, a, :past_len, :2][m] * position_scale
                 pred_top_xy = pred_np[i, int(top_mode[i].item())] * position_scale
+                gt_fut_xy = gt_np[i] * position_scale
                 pred_lab = classify_maneuver(past_xy, pred_top_xy, dt=1.0)
+
+                # Signed turns (deg): + = left/CCW, - = right/CW. Tests "does the model
+                # continue the past turn or straighten from the last past point?"
+                past_turn = signed_turn_deg(past_xy)
+                gt_fut_turn = signed_turn_deg(gt_fut_xy)
+                pred_fut_turn = signed_turn_deg(pred_top_xy)
 
                 rows.append({
                     "gt_coarse": gt_labels[i]["coarse"],
@@ -153,6 +161,9 @@ def main(cfg):
                     "gt_cv_fde_m": gt_labels[i]["cv_fde_m"],
                     "pred_coarse": pred_lab["coarse"],
                     "pred_heading_deg": pred_lab["heading_change_deg"],
+                    "past_turn_deg": past_turn,
+                    "gt_fut_turn_deg": gt_fut_turn,
+                    "pred_fut_turn_deg": pred_fut_turn,
                     "min_ade_m": float(min_ade[i]),
                     "min_fde_m": float(min_fde[i]),
                     "bl_min_fde_m": float(bl_min_fde[i]) if bl_min_fde is not None else float("nan"),
@@ -225,6 +236,47 @@ def main(cfg):
     pr_head = np.array([r["pred_heading_deg"] for r in rows if np.isfinite(r["pred_heading_deg"])])
     lines.append(f"\n- Mean GT heading change: {gt_head.mean():.1f}°   |   "
                  f"Mean predicted top-mode heading change: {pr_head.mean():.1f}°")
+
+    # ---- Turn-continuation: does the model continue a mid-turn past, or straighten? ----
+    # Tests the observation: "when the past 300 steps are curved (mid-turn), the model
+    # draws a straight line from the last point instead of continuing the turn."
+    PAST_TURN_THR = 15.0   # deg over the past window to call the ship "mid-turn"
+    STRAIGHT_THR = 10.0    # deg over the future below which a prediction is "straight"
+    curved = [r for r in rows if abs(r["past_turn_deg"]) >= PAST_TURN_THR]
+    lines.append("\n## Turn continuation — when the PAST is curved (ship mid-turn)\n")
+    lines.append(f"_Past considered curved if |past signed turn| ≥ {PAST_TURN_THR}°. "
+                 f"Prediction 'straight' if |future signed turn| < {STRAIGHT_THR}°. "
+                 f"'Continues' = predicted turn same direction as the past turn._\n")
+    if not curved:
+        lines.append(f"No curved-past windows found (of {total:,}).")
+    else:
+        nc = len(curved)
+        # What GT does after a curved past:
+        gt_cont = sum(1 for r in curved if np.sign(r["gt_fut_turn_deg"]) == np.sign(r["past_turn_deg"])
+                      and abs(r["gt_fut_turn_deg"]) >= STRAIGHT_THR)
+        gt_straight = sum(1 for r in curved if abs(r["gt_fut_turn_deg"]) < STRAIGHT_THR)
+        # What the MODEL (most-likely mode) does after a curved past:
+        pr_cont = sum(1 for r in curved if np.sign(r["pred_fut_turn_deg"]) == np.sign(r["past_turn_deg"])
+                      and abs(r["pred_fut_turn_deg"]) >= STRAIGHT_THR)
+        pr_straight = sum(1 for r in curved if abs(r["pred_fut_turn_deg"]) < STRAIGHT_THR)
+        lines.append(f"- Curved-past windows: **{nc:,}** ({_pct(nc,total):.1f}% of all)")
+        lines.append(f"- Ground truth: continues the turn {gt_cont:,} ({_pct(gt_cont,nc):.1f}%) | "
+                     f"goes straight {gt_straight:,} ({_pct(gt_straight,nc):.1f}%)")
+        lines.append(f"- Model top-mode: continues the turn {pr_cont:,} ({_pct(pr_cont,nc):.1f}%) | "
+                     f"goes straight {pr_straight:,} ({_pct(pr_straight,nc):.1f}%)")
+        # The key test: among curved-past windows where GT KEEPS turning, what does the model do?
+        gt_keeps = [r for r in curved if np.sign(r["gt_fut_turn_deg"]) == np.sign(r["past_turn_deg"])
+                    and abs(r["gt_fut_turn_deg"]) >= STRAIGHT_THR]
+        if gt_keeps:
+            model_straight = sum(1 for r in gt_keeps if abs(r["pred_fut_turn_deg"]) < STRAIGHT_THR)
+            lines.append(f"\n**Of {len(gt_keeps):,} windows where the past is curved AND the ship keeps "
+                         f"turning, the model's top mode goes straight {model_straight:,} times "
+                         f"({_pct(model_straight,len(gt_keeps)):.1f}%).**")
+            pt = np.array([r["past_turn_deg"] for r in gt_keeps])
+            gtf = np.array([r["gt_fut_turn_deg"] for r in gt_keeps])
+            prf = np.array([r["pred_fut_turn_deg"] for r in gt_keeps])
+            lines.append(f"- Mean signed turn (deg): past={pt.mean():+.1f}  GT-future={gtf.mean():+.1f}  "
+                         f"model-future={prf.mean():+.1f}  (same sign as past = continuing)")
 
     report = "\n".join(lines) + "\n"
 
