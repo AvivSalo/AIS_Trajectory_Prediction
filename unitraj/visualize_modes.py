@@ -118,10 +118,14 @@ def main(cfg):
                 moving = past_path >= 150.0 and past_disp >= 80.0
                 past_turn = signed_turn_deg(past_xy)
                 gt_turn = signed_turn_deg(gt_xy) if gt_xy.shape[0] >= 4 else 0.0
+                top = int(np.argmax(probs))
+                pred_top_turn = signed_turn_deg(modes_xy[top])
+                modes_turn = np.array([signed_turn_deg(modes_xy[k]) for k in range(modes_xy.shape[0])])
                 candidates.append(({"moving": moving, "abs_turn": abs(past_turn)}, {
                     "sid": str(sid[i]) if i < len(sid) else f"b{bi}_{i}",
                     "past_xy": past_xy, "gt_xy": gt_xy, "modes_xy": modes_xy,
                     "probs": probs, "past_turn": past_turn, "gt_turn": gt_turn,
+                    "pred_top_turn": pred_top_turn, "top_mode": top, "modes_turn": modes_turn,
                     "moving": moving, "past_path": past_path,
                 }))
             if bi % 5 == 0:
@@ -131,20 +135,62 @@ def main(cfg):
         print("No candidate windows.")
         return
 
-    # Only consider MOVING vessels (exclude anchored noise). Among them, prioritize
-    # curved-past (genuine mid-turn) windows, keeping a few moving-straight for contrast.
+    # Only consider MOVING vessels (exclude anchored noise).
     moving = [c for c in candidates if c[0]["moving"]]
     print(f"  moving windows: {len(moving)} / {len(candidates)} total")
     if not moving:
         print("  No moving windows passed the filter — relaxing to all candidates.")
         moving = candidates
-    moving.sort(key=lambda c: -c[0]["abs_turn"])
-    curved = [c for c in moving if c[0]["abs_turn"] >= 15.0]
-    straight = [c for c in moving if c[0]["abs_turn"] < 15.0]
-    n_curved = min(len(curved), int(max_plots * 0.7))
-    n_straight = min(len(straight), max_plots - n_curved)
-    straight_pick = straight[:: max(1, len(straight) // max(1, n_straight))][:n_straight] if straight else []
-    chosen = curved[:n_curved] + straight_pick
+
+    select = str(getattr(cfg, "select", "curved"))
+    TURN_THR = 20.0  # deg of future curvature to count as a clear turn
+    if select == "match":
+        # DIRECTION match: windows where GT heads in a clearly different direction than
+        # "straight ahead" (the recent past heading) — i.e. the ship turns — AND a prominent
+        # mode points in GT's direction. Proves the model predicts the turn (direction).
+        def _ang(v):
+            return np.degrees(np.arctan2(v[1], v[0]))
+        def _adiff(a, b):
+            return abs((a - b + 180.0) % 360.0 - 180.0)
+        DEVIATE_THR = 25.0   # GT must deviate ≥ this from straight-ahead to count as a turn
+        MATCH_TOL = 30.0     # a mode "matches" if within this of GT's direction
+        match = []
+        for c in moving:
+            w = c[1]
+            px, gx = w["past_xy"], w["gt_xy"]
+            if px.shape[0] < 8 or gx.shape[0] < 8:
+                continue
+            straight_dir = _ang(px[-1] - px[-6])     # recent heading = straight-ahead
+            gt_dir = _ang(gx[-1] - gx[0])            # GT overall future direction
+            deviate = _adiff(gt_dir, straight_dir)
+            if deviate < DEVIATE_THR:
+                continue
+            best = None
+            for k in range(w["modes_xy"].shape[0]):
+                md = _ang(w["modes_xy"][k][-1] - w["modes_xy"][k][0])
+                if _adiff(md, gt_dir) <= MATCH_TOL:
+                    if best is None or w["probs"][k] > w["probs"][best]:
+                        best = k
+            if best is None:
+                continue
+            w["match_mode"] = int(best)
+            w["match_prob"] = float(w["probs"][best])
+            w["match_turn"] = float(w["modes_turn"][best])
+            w["deviate"] = float(deviate)
+            match.append(c)
+        match.sort(key=lambda c: (-c[1]["past_path"], -c[1]["match_prob"]))
+        chosen = match[:max_plots]
+        print(f"  'match' windows (GT deviates ≥{DEVIATE_THR:.0f}° from straight AND a mode "
+              f"within {MATCH_TOL:.0f}° of GT dir): {len(match)}")
+    else:
+        # Prioritize curved-past, keep a few moving-straight for contrast.
+        moving.sort(key=lambda c: -c[0]["abs_turn"])
+        curved = [c for c in moving if c[0]["abs_turn"] >= 15.0]
+        straight = [c for c in moving if c[0]["abs_turn"] < 15.0]
+        n_curved = min(len(curved), int(max_plots * 0.7))
+        n_straight = min(len(straight), max_plots - n_curved)
+        straight_pick = straight[:: max(1, len(straight) // max(1, n_straight))][:n_straight] if straight else []
+        chosen = curved[:n_curved] + straight_pick
 
     cmap = plt.get_cmap("tab10")
     n_made = 0
@@ -168,8 +214,12 @@ def main(cfg):
         ax.set_aspect("equal", adjustable="datalim")
         ax.grid(True, alpha=0.3)
         ax.set_xlabel("x (m, ego-relative)"); ax.set_ylabel("y (m, ego-relative)")
-        ax.set_title(f"{w['sid']}\npast turn={w['past_turn']:+.0f}°  GT future turn={w['gt_turn']:+.0f}°  "
-                     f"(+=left/CCW)  past path={w['past_path']:.0f}m", fontsize=9)
+        _match_txt = ""
+        if "match_mode" in w:
+            _match_txt = f"  MATCH mode#{w['match_mode']}(p={w['match_prob']*100:.0f}%)={w['match_turn']:+.0f}°"
+        ax.set_title(f"{w['sid']}\npast={w['past_turn']:+.0f}°  GT future={w['gt_turn']:+.0f}°  "
+                     f"top-mode(#{w['top_mode']})={w['pred_top_turn']:+.0f}°{_match_txt}  (+=left/CCW)  "
+                     f"path={w['past_path']:.0f}m", fontsize=8)
         # legend ordered by probability descending
         handles, labels = ax.get_legend_handles_labels()
         ax.legend(handles, labels, fontsize=7, loc="best")
