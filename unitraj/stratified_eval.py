@@ -155,7 +155,15 @@ def main(cfg):
                 gt_fut_turn = signed_turn_deg(gt_fut_xy)
                 pred_fut_turn = signed_turn_deg(pred_top_xy)
 
+                # Motion filter: signed-turn is meaningless at near-zero speed (anchored
+                # vessels yield huge spurious turns from AIS noise). Flag genuinely moving.
+                past_path = float(np.linalg.norm(np.diff(past_xy, axis=0), axis=1).sum()) if past_xy.shape[0] >= 2 else 0.0
+                past_disp = float(np.linalg.norm(past_xy[-1] - past_xy[0])) if past_xy.shape[0] >= 2 else 0.0
+                moving = bool(past_path >= 150.0 and past_disp >= 80.0)
+
                 rows.append({
+                    "moving": moving,
+                    "past_path_m": past_path,
                     "gt_coarse": gt_labels[i]["coarse"],
                     "gt_heading_deg": gt_labels[i]["heading_change_deg"],
                     "gt_cv_fde_m": gt_labels[i]["cv_fde_m"],
@@ -242,8 +250,13 @@ def main(cfg):
     # draws a straight line from the last point instead of continuing the turn."
     PAST_TURN_THR = 15.0   # deg over the past window to call the ship "mid-turn"
     STRAIGHT_THR = 10.0    # deg over the future below which a prediction is "straight"
-    curved = [r for r in rows if abs(r["past_turn_deg"]) >= PAST_TURN_THR]
+    n_moving = sum(1 for r in rows if r["moving"])
+    # MOVING-ONLY: exclude anchored/near-stationary windows where signed-turn is AIS noise.
+    curved = [r for r in rows if r["moving"] and abs(r["past_turn_deg"]) >= PAST_TURN_THR]
     lines.append("\n## Turn continuation — when the PAST is curved (ship mid-turn)\n")
+    lines.append(f"_MOVING windows only (past path ≥ 150 m AND displacement ≥ 80 m): "
+                 f"{n_moving:,} of {total:,} windows are moving; the rest are anchored/"
+                 f"stopping and excluded (their signed-turn is AIS heading noise)._\n")
     lines.append(f"_Past considered curved if |past signed turn| ≥ {PAST_TURN_THR}°. "
                  f"Prediction 'straight' if |future signed turn| < {STRAIGHT_THR}°. "
                  f"'Continues' = predicted turn same direction as the past turn._\n")
