@@ -14,8 +14,8 @@
 # metric unchanged, so the honest thing is to report the mode count per model.
 # =============================================================================
 
-exp_name: 'test2025_wayformer'
-ckpt_path: '/home/ubuntu/projects/AIS_Trajectory_Prediction/unitraj_ckpt/ais_4hours_test_100scenarios/epoch=95-val/brier_fde=19.76.ckpt'
+exp_name: 'test2025_wayformer_5min'
+ckpt_path: '/home/ubuntu/projects/AIS_Trajectory_Prediction/unitraj_ckpt/wayformer_5min_s150_200_v2/epoch=96-val/brier_fde=36.97.ckpt'
 seed: 42
 debug: False
 devices: [ 0 ]
