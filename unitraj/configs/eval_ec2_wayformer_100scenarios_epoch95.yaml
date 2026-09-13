@@ -1,0 +1,37 @@
+# Evaluation config — Wayformer-AIS, run: ais_4hours_test_100scenarios, best epoch 95
+# Checkpoint: unitraj_ckpt/ais_4hours_test_100scenarios/epoch=95-val/brier_fde=19.76.ckpt
+# Stride 300 matches the training config (non-overlapping windows)
+exp_name: 'eval_wayformer_ais_100scenarios_epoch95'
+ckpt_path: '/home/ubuntu/projects/AIS_Trajectory_Prediction/unitraj_ckpt/ais_4hours_test_100scenarios/epoch=95-val/brier_fde=19.76.ckpt'
+seed: 42
+debug: False
+devices: [ 0 ]
+normalize_data: True
+
+# EC2 val set
+load_num_workers: 8
+train_data_path: [ "/home/ubuntu/projects/AIS_Trajectory_Prediction/unitraj/data/processed_ais_4hours_optimized/train" ]
+val_data_path:   [ "/home/ubuntu/projects/AIS_Trajectory_Prediction/unitraj/data/processed_ais_4hours_optimized/val" ]
+cache_path: "./cache_eval_100scenarios"
+max_data_num: [ null ]
+starting_frame: [ 0 ]
+past_len: 300
+future_len: 300
+stride: 300
+object_type: [ 'VESSEL' ]
+line_type: [ ]
+masked_attributes: [ 'z_axis', 'size' ]
+trajectory_sample_interval: 1
+only_train_on_ego: False
+center_offset_of_map: [ 0.0, 0.0 ]
+use_cache: False
+overwrite_cache: False
+store_data_in_memory: False
+
+nuscenes_dataroot: ''
+eval_nuscenes: False
+eval_waymo: False
+eval_argoverse2: False
+
+defaults:
+  - method: wayformer_ais_5min_ec2

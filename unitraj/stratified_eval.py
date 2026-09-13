@@ -121,6 +121,18 @@ def main(cfg):
             top_mode = (prob.argmax(1) if prob is not None
                         else torch.zeros(pred.shape[0], dtype=torch.long, device=device))
 
+            # Brier-FDE, matching base_model.compute_official_evaluation():
+            #   brier_fde = minFDE + (1 - p[best-FDE mode])^2
+            # A model that emits no probabilities is treated as fully confident (p=1),
+            # which collapses Brier-FDE onto minFDE — the behaviour the deterministic
+            # baselines already show in their logged val numbers.
+            best_fde_idx = fde_modes.argmin(1)
+            if prob is not None:
+                p_best = prob[torch.arange(pred.shape[0], device=device), best_fde_idx]
+            else:
+                p_best = torch.ones(pred.shape[0], device=device)
+            brier_fde = (min_fde + ((1.0 - p_best) ** 2).cpu().numpy())
+
             # Baseline
             bl_min_fde = None
             if baseline is not None:
@@ -174,6 +186,7 @@ def main(cfg):
                     "pred_fut_turn_deg": pred_fut_turn,
                     "min_ade_m": float(min_ade[i]),
                     "min_fde_m": float(min_fde[i]),
+                    "brier_fde_m": float(brier_fde[i]),
                     "bl_min_fde_m": float(bl_min_fde[i]) if bl_min_fde is not None else float("nan"),
                     "bl_min_ade_m": float(bl_min_ade[i]) if bl_min_fde is not None else float("nan"),
                 })
@@ -188,6 +201,7 @@ def main(cfg):
 
     ade = np.array([r["min_ade_m"] for r in rows])
     fde = np.array([r["min_fde_m"] for r in rows])
+    brier = np.array([r["brier_fde_m"] for r in rows])
     bl_fde = np.array([r["bl_min_fde_m"] for r in rows])
 
     # ---- Build report ----
@@ -200,6 +214,7 @@ def main(cfg):
 
     lines.append("## Overall\n")
     lines.append(f"- minADE6: **{ade.mean():.2f} m**   minFDE6: **{fde.mean():.2f} m**")
+    lines.append(f"- Brier-FDE: **{brier.mean():.2f}**")
     lines.append(f"- Miss@2m: {_pct((fde>2).sum(),total):.1f}%   Miss@10m: {_pct((fde>10).sum(),total):.1f}%   Miss@20m: {_pct((fde>20).sum(),total):.1f}%")
     if baseline is not None:
         lines.append(f"- Baseline (OLS) minFDE6: {np.nanmean(bl_fde):.2f} m   → model−baseline minFDE: **{fde.mean()-np.nanmean(bl_fde):+.2f} m**")
@@ -307,6 +322,50 @@ def main(cfg):
     print("\n" + report)
     print(f"Wrote: {md_path}")
     print(f"Wrote: {csv_path}")
+
+    # ---- W&B ----
+    # Every eval run logs the settings that actually shaped the number (data path,
+    # stride, max_data_num, horizons, num_modes, ckpt) alongside the metrics, so two
+    # runs can never again be compared without knowing whether they were measured
+    # the same way. Set wandb_log=False to skip.
+    if bool(getattr(cfg, "wandb_log", True)):
+        try:
+            import wandb
+            eval_cfg = {
+                "ckpt_path": str(getattr(cfg, "ckpt_path", "")),
+                "val_data_path": [str(x) for x in (getattr(cfg, "val_data_path", []) or [])],
+                "max_data_num": getattr(cfg, "max_data_num", None),
+                "stride": getattr(cfg, "stride", None),
+                "past_len": past_len,
+                "future_len": getattr(cfg, "future_len", None),
+                "num_modes": getattr(cfg, "num_modes", None),
+                "eval_batch_size": batch_size,
+                "eval_max_batches": max_batches,
+                "position_scale": position_scale,
+                "model_name": model_name,
+                "n_samples": total,
+            }
+            run = wandb.init(
+                project=str(getattr(cfg, "wandb_project", "unitraj")),
+                entity=getattr(cfg, "wandb_entity", None),
+                name=exp_name,
+                job_type="eval",
+                config=eval_cfg,
+                settings=wandb.Settings(init_timeout=180),
+            )
+            run.log({
+                "test/minADE6": float(ade.mean()),
+                "test/minFDE6": float(fde.mean()),
+                "test/brier_fde": float(brier.mean()),
+                "test/miss_rate_2m": float((fde > 2).mean()),
+                "test/miss_rate_10m": float((fde > 10).mean()),
+                "test/miss_rate_20m": float((fde > 20).mean()),
+                "test/n_samples": total,
+            })
+            run.finish()
+            print(f"Logged to W&B: {exp_name}")
+        except Exception as exc:
+            print(f"[wandb] logging skipped: {type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":
