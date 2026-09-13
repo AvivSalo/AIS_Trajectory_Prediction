@@ -11,6 +11,7 @@ __all__ = {
     'traisformer': AISDataset,    # TrAISformer baseline shares the AIS dataset
     'ais_acnet': AISDataset,      # AIS-ACNet baseline shares the AIS dataset
     'gat_lstm': AISDataset,       # GAT-LSTM baseline shares the AIS dataset
+    'baseline_linear': AISDataset,  # OLS constant-velocity baseline shares the AIS dataset
 }
 
 
