@@ -3,3 +3,7 @@
 /unitraj/outputs/
 /unitraj/tmp
 .DS_Store
+
+# one-off analysis scripts (not part of the pipeline)
+unitraj/tools/plot_ade_horizon.py
+unitraj/tools/eda_val_dashboard.py
