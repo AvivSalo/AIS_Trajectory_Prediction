@@ -104,6 +104,20 @@ class EvaluationCallback(pl.Callback):
                 except Exception as e:
                     logger.debug(f"Baseline comparison skipped: {e}")
 
+            # --- Choose which mode to VISUALIZE ---
+            # evaluation.py serves several AIS baselines and `pred_trajs[:, 0]` is an
+            # ARBITRARY slot (the modes are NOT probability-sorted), so it can always draw
+            # the model's straight/mean hypothesis even when the most-likely mode curves.
+            # For wayformer_ais specifically, visualize the most-likely mode (argmax of the
+            # softmaxed probabilities). Other models keep the previous mode-0 behavior so
+            # their visualization is unchanged.
+            pred_prob = prediction.get('predicted_probability')
+            if _model_name == 'wayformer_ais' and pred_prob is not None and pred_prob.dim() == 2:
+                viz_mode_idx = pred_prob.argmax(dim=1)  # [B]
+            else:
+                viz_mode_idx = torch.zeros(pred_trajs.shape[0], dtype=torch.long,
+                                           device=pred_trajs.device)
+
             for i in range(batch_size):
                 scenario_id = scenario_ids[i]
 
@@ -118,8 +132,10 @@ class EvaluationCallback(pl.Callback):
                     vessel_id = scenario_id
                     time_offset = 0
 
-                # Store normalized ego-relative prediction (mode 0, best mode)
-                pred_norm = pred_trajs[i, 0, :, :2].detach().cpu().numpy()  # [T, 2]
+                # Store normalized ego-relative prediction.
+                # wayformer_ais: most-likely mode (see viz_mode_idx above); others: mode 0.
+                _viz_m = int(viz_mode_idx[i])
+                pred_norm = pred_trajs[i, _viz_m, :, :2].detach().cpu().numpy()  # [T, 2]
                 gt_norm = gt_trajs[i].detach().cpu().numpy()                 # [T, 2]
 
                 self.vessel_pred_windows.setdefault(vessel_id, []).append((time_offset, pred_norm))

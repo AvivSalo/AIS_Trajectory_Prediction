@@ -1,0 +1,52 @@
+# =============================================================================
+# 2025 held-out TEST evaluation — gat_lstm
+#
+# All five eval_test2025_*.yaml configs are IDENTICAL except for exp_name,
+# ckpt_path and method. Same test split, same stride, same max_data_num (null =
+# every scene), same horizons. The validation numbers in the paper were NOT
+# measured this way (stride and max_data_num varied per model, and one run logged
+# no config at all), which is precisely what this set of configs exists to fix.
+#
+# num_modes is NOT overridden here: it comes from the method config and reflects
+# what each architecture can actually emit (Wayformer/TrAISformer/baseline = 6,
+# AIS-ACNet/GAT-LSTM = 1, deterministic by construction). Forcing 6 on a
+# single-mode model would only duplicate one trajectory six times and leave every
+# metric unchanged, so the honest thing is to report the mode count per model.
+# =============================================================================
+
+exp_name: 'test2025_gat_lstm'
+ckpt_path: '/home/ubuntu/projects/AIS_Trajectory_Prediction/unitraj/unitraj_ckpt/gat_lstm_5min_v1/epoch=20-val/brier_fde=659.19.ckpt'
+seed: 42
+debug: False
+devices: [ 0 ]
+normalize_data: True
+
+load_num_workers: 8
+train_data_path: [ "/home/ubuntu/projects/AIS_Trajectory_Prediction/unitraj/data/processed_ais_4hours_optimized/train" ]
+val_data_path:   [ "/home/ubuntu/projects/AIS_Trajectory_Prediction/unitraj/data/processed_ais_4hours_optimized/test" ]
+cache_path: "./cache_test2025_gat_lstm"
+max_data_num: [ null ]             # every scene in the test split
+starting_frame: [ 0 ]
+past_len: 300                      # 5 min history @ 1 Hz
+future_len: 300                    # 5 min prediction @ 1 Hz
+stride: 300                        # non-overlapping windows
+object_type: [ 'VESSEL' ]
+line_type: [ ]
+masked_attributes: [ 'z_axis', 'size' ]
+trajectory_sample_interval: 1
+only_train_on_ego: False
+center_offset_of_map: [ 0.0, 0.0 ]
+use_cache: False
+overwrite_cache: False
+store_data_in_memory: False
+
+wandb_project: 'unitraj'
+wandb_entity: 'aviv_salo'
+
+nuscenes_dataroot: ''
+eval_nuscenes: False
+eval_waymo: False
+eval_argoverse2: False
+
+defaults:
+  - method: gat_lstm
