@@ -280,8 +280,7 @@ python tools/ais_data_preprocessor.py
 ```
 
 See [`unitraj/tools/README_AIS_PREPROCESSING.md`](unitraj/tools/README_AIS_PREPROCESSING.md) for the
-full preprocessing reference and [`README_AIS_TRAJ.md`](README_AIS_TRAJ.md) for the end-to-end data
-guide.
+full preprocessing reference.
 
 ### 2 · Train
 
