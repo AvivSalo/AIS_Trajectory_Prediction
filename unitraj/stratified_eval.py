@@ -289,6 +289,10 @@ def main(cfg):
         baseline = BaselineLinear(config=cfg).to(device).eval()
 
     rows = []  # per-sample dicts
+    # Per-timestep error accumulators for the horizon curve (summed over the split).
+    horiz_ade = 0.0
+    horiz_fde = 0.0
+    horiz_n = 0
 
     with torch.no_grad():
         for bi, batch in enumerate(loader):
@@ -304,8 +308,19 @@ def main(cfg):
             gt = inp["center_gt_trajs"][:, :, :2]                       # [B, T, 2]
             gt_e = gt.unsqueeze(1)                                       # [B, 1, T, 2]
 
-            ade_modes = torch.norm(pred - gt_e, dim=-1).mean(-1)        # [B, K]
-            fde_modes = torch.norm(pred[:, :, -1] - gt_e[:, :, -1], dim=-1)  # [B, K]
+            d_t = torch.norm(pred - gt_e, dim=-1)                       # [B, K, T]
+            ade_modes = d_t.mean(-1)                                    # [B, K]
+            fde_modes = d_t[:, :, -1]                                   # [B, K]
+
+            # Error as a function of how far ahead the model is asked to look,
+            # measured rather than extrapolated: minADE / minFDE recomputed with the
+            # horizon truncated at every timestep t = 1..T. Summed here, divided by
+            # the window count and written out as <exp>_horizon.csv below.
+            _T = d_t.shape[-1]
+            _cum = torch.cumsum(d_t, dim=-1) / torch.arange(1, _T + 1, device=device)
+            horiz_ade = horiz_ade + _cum.min(1).values.sum(0) * position_scale
+            horiz_fde = horiz_fde + d_t.min(1).values.sum(0) * position_scale
+            horiz_n += d_t.shape[0]
             min_ade = (ade_modes.min(1).values * position_scale).cpu().numpy()
             min_fde = (fde_modes.min(1).values * position_scale).cpu().numpy()
 
@@ -601,6 +616,17 @@ def main(cfg):
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
+
+    if horiz_n:
+        hz_path = os.path.join(CLAUDEDOCS, base + "_horizon.csv")
+        _a = (horiz_ade / horiz_n).cpu().numpy()
+        _b = (horiz_fde / horiz_n).cpu().numpy()
+        with open(hz_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["t_sec", "min_ade_m", "min_fde_m"])
+            for t in range(len(_a)):
+                w.writerow([t + 1, f"{_a[t]:.4f}", f"{_b[t]:.4f}"])
+        print(f"Wrote: {hz_path}")
 
     print("\n" + report)
     print(f"Wrote: {md_path}")
