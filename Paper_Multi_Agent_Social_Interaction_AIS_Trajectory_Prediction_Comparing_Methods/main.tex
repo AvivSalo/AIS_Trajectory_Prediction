@@ -144,7 +144,7 @@ Vessel trajectory prediction from AIS underpins automated collision avoidance,
   Despite a growing body of AIS prediction literature, a practitioner seeking to select
   or deploy a model faces a fundamental obstacle: the published results cannot be
   meaningfully compared.  TrAISformer~\citep{nguyen2021traisformer} is evaluated on
-  Finnish–Baltic AIS data with a 30-minute horizon and cross-entropy loss;
+  Finnish--Baltic AIS data with a 30-minute horizon and cross-entropy loss;
   AIS-ACNet~\citep{shin2024aisacnet} uses South Korean coastal data with 10-second
   prediction steps; GAT-LSTM~\citep{zhao2023gatlstm} reports next-step ADE on
   Chinese coastal waters; TPTrans~\citep{wang2024tptrans} evaluates on a Chinese
@@ -568,7 +568,7 @@ Vessel trajectory prediction from AIS underpins automated collision avoidance,
   The raw feed presents three structural challenges that the preprocessing pipeline
   (Section~\ref{sec:pipeline}) addresses:
   \textbf{(1)}~duplicate records arising from the multi-row-per-timestamp encoding;
-  \textbf{(2)}~irregular sampling intervals (AIS beacons transmit every 2–30\,s depending
+  \textbf{(2)}~irregular sampling intervals (AIS beacons transmit every 2--30\,s depending
   on vessel speed and transponder class); and
   \textbf{(3)}~geodetic coordinates that must be projected into an ego-relative Cartesian
   frame suitable for neural network training.
@@ -588,7 +588,7 @@ Vessel trajectory prediction from AIS underpins automated collision avoidance,
   This produces a scene-relative time axis starting at zero, making temporal windows invariant to absolute recording date.
 
   \paragraph{Step 3 --- Trajectory Interpolation.}
-  Ego vessels operate at approximately 1~Hz and require no interpolation. Target vessels exhibit irregular sampling gaps (typically 20–380 seconds). To produce a consistent 1~Hz feature stream for all agents,
+  Ego vessels operate at approximately 1~Hz and require no interpolation. Target vessels exhibit irregular sampling gaps (typically 20--380 seconds). To produce a consistent 1~Hz feature stream for all agents,
   target trajectories are interpolated under the following policy:
   \begin{itemize}
       \item Gaps $\leq 1.5$\,s: no interpolation (already consistent).
@@ -669,7 +669,7 @@ Vessel trajectory prediction from AIS underpins automated collision avoidance,
           \toprule
           \textbf{Parameter} & \textbf{Value} \\
           \midrule
-          Input sampling rate         & 1–30 s (raw AIS) \\
+          Input sampling rate         & 1--30 s (raw AIS) \\
           Output sampling rate        & 1 Hz \\
           Max interpolation gap       & 400 s \\
           Coordinate frame            & Ego-relative flat-Earth Cartesian \\
