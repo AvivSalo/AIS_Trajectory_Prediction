@@ -6,3 +6,28 @@
 
 # one-off analysis scripts (not part of the pipeline)
 unitraj/tools/eda_val_dashboard.py
+
+# Python / build artifacts
+__pycache__/
+*.pyc
+build/
+*.egg-info/
+
+# IDE and tool scratch
+.idea/
+.playwright-mcp/
+
+# Analysis outputs - derived from proprietary Orca AI data, keep out of a public repo
+claudedocs/
+
+# Paper: local snapshots of earlier drafts (git history supersedes them)
+Paper_Multi_Agent_Social_Interaction_AIS_Trajectory_Prediction_Comparing_Methods/backup_29062026/
+Paper_Multi_Agent_Social_Interaction_AIS_Trajectory_Prediction_Comparing_Methods/from_overleaf_13092026/
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.synctex.gz
