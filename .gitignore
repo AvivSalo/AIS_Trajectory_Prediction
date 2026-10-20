@@ -20,9 +20,12 @@ build/
 # Analysis outputs - derived from proprietary Orca AI data, keep out of a public repo
 claudedocs/
 
-# Paper: local snapshots of earlier drafts (git history supersedes them)
+# Paper: track only main.tex, references.bib and figures/.
+# Everything else here is a local draft snapshot; git history supersedes them.
 Paper_Multi_Agent_Social_Interaction_AIS_Trajectory_Prediction_Comparing_Methods/backup_29062026/
 Paper_Multi_Agent_Social_Interaction_AIS_Trajectory_Prediction_Comparing_Methods/from_overleaf_13092026/
+Paper_Multi_Agent_Social_Interaction_AIS_Trajectory_Prediction_Comparing_Methods/*_backup_*.tex
+Paper_Multi_Agent_Social_Interaction_AIS_Trajectory_Prediction_Comparing_Methods/progression_report*.tex
 
 # LaTeX build artifacts
 *.aux
