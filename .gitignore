@@ -31,3 +31,7 @@ Paper_Multi_Agent_Social_Interaction_AIS_Trajectory_Prediction_Comparing_Methods
 *.fls
 *.fdb_latexmk
 *.synctex.gz
+
+# Raw and processed AIS data - proprietary Orca AI fleet data, never commit
+data/
+unitraj/data/
